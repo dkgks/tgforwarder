@@ -449,8 +449,11 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # === 5. OK → approve and forward ===
-    state.update(user.id, msgs_checked=checked, approved=True, spam_count=spam_c, abuse_count=0)
-    logger.info(f"User {user.id} APPROVED")
+    state.update(user.id, msgs_checked=checked, spam_count=spam_c, abuse_count=0)
+    logger.info(f"User {user.id} msg#{checked}/10 → OK")
+    if checked >= 10:
+        state.update(user.id, approved=True)
+        logger.info(f"User {user.id} APPROVED")
     await forward_to_owner(user.id, user.full_name, user.username, text)
 
     # Auto-reply for newly approved user
