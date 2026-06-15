@@ -1149,7 +1149,7 @@ async def main():
         handle_stranger  # owner non-command text → check if replying to a forwarded msg
     ), group=0)
     # Other strangers (group=1, lower priority)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_stranger), group=1)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.User(user_id=OWNER_ID), handle_stranger), group=1)
     app.add_handler(CallbackQueryHandler(handle_callback))
 
     async with app:
