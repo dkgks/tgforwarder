@@ -1,0 +1,24 @@
+# 实例配置和数据（含敏感 token）
+instances/
+config.json
+state.json
+stats.json
+auto_reply.json
+keywords.json
+*.log
+*.tmp
+/tmp/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
