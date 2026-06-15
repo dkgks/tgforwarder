@@ -125,7 +125,8 @@ class State:
     def get(self, uid):
         return self.users.get(uid, {"msgs_checked": 0, "approved": False, "spam_count": 0,
                                     "full_name": "", "username": "", "first_seen": "",
-                                    "blocked": False, "auto_reply_used": 0})
+                                    "blocked": False, "auto_reply_used": 0,
+                                    "abuse_count": 0})
 
     def update(self, uid, **kw):
         entry = self.get(uid)
@@ -238,7 +239,7 @@ OK = 正常消息
                 f"{AI_BASE_URL}/chat/completions",
                 headers={"Authorization": f"Bearer {AI_API_KEY}"},
                 json={
-                    "model": "Qwen/Qwen2.5-7B-Instruct",
+                    "model": CLASSIFY_MODEL,
                     "messages": [
                         {"role": "system", "content": "你是一个消息分类器。只回答一个标签词。"},
                         {"role": "user", "content": prompt}
@@ -332,9 +333,13 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Owner reply check
         reply = msg.reply_to_message
         if reply and reply.message_id in reply_map:
-            sid = reply_map[reply.message_id]
+            sid = reply_map.pop(reply.message_id)
             await send_msg(sid, msg.text)
             logger.info(f"Owner replied to stranger {sid}")
+            # Auto-approve user that owner replied to
+            if sid in state.users:
+                state.update(sid, approved=True)
+                logger.info(f"Auto-approved user {sid} (owner replied)")
         return
 
     text = msg.text
@@ -354,16 +359,19 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # === 1. Fast local pre-check for abuse keywords ===
     local = local_check(text)
     if local == "ABUSE":
-        # Clear abuse → insult if AI enabled, otherwise generic reply
+        # Cumulative abuse count from user state
+        abuse_c = us.get("abuse_count", 0) + 1
         checked += 1
-        if AI_ENABLED:
+        if AI_ENABLED and abuse_c >= 2:
+            # 2nd+ abuse → AI insult
             insult = await ai_generate_insult(text)
+            stats_add("abuse_replies")
         else:
-            insult = "请注意言辞，辱骂信息已被屏蔽。"
+            # 1st abuse → polite warning (with or without AI)
+            insult = "请文明用语，这条内容不会转发给管理员。"
         await send_msg(user.id, insult)
-        stats_add("abuse_replies")
-        state.update(user.id, msgs_checked=checked, spam_count=spam_c)
-        logger.info(f"ABUSE from {user.id} (local hit) → replied")
+        state.update(user.id, msgs_checked=checked, spam_count=spam_c, abuse_count=abuse_c)
+        logger.info(f"ABUSE from {user.id} (local hit, abuse #{abuse_c}) → replied")
         return
 
     # === 2. Fast local pre-check for spam keywords ===
@@ -377,7 +385,7 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_msg(user.id, "请注意言辞，再发广告将被拉黑。")
         else:
             stats_add("ads_blocked")
-            await send_msg(user.id, "傻逼")
+            await send_msg(user.id, "傻逼广告")
         checked += 1
         state.update(user.id, msgs_checked=checked, spam_count=spam_c)
         logger.info(f"SPAM from {user.id} (local hit, spam #{spam_c}) → auto-replied")
@@ -387,7 +395,8 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if us.get("approved"):
         checked += 1
         logger.info(f"User {user.id} msg#{checked}/10 → OK (approved): {text[:100]}")
-        state.update(user.id, msgs_checked=checked, spam_count=spam_c)
+        # Reset abuse_count on normal message (breaks consecutive chain)
+        state.update(user.id, msgs_checked=checked, spam_count=spam_c, abuse_count=0)
         await forward_to_owner(user.id, user.full_name, user.username, text)
 
         # Auto-reply for approved users (if enabled and count not exhausted)
@@ -410,15 +419,18 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"User {user.id} msg#{checked}/10 → {label}: {text[:100]}")
 
     if "ABUSE" in label:
-        # AI found abuse → insult
-        if AI_ENABLED:
+        # Cumulative abuse count from user state
+        abuse_c = us.get("abuse_count", 0) + 1
+        if AI_ENABLED and abuse_c >= 2:
+            # 2nd+ abuse → AI insult
             insult = await ai_generate_insult(text)
+            stats_add("abuse_replies")
         else:
-            insult = "请注意言辞，辱骂信息已被屏蔽。"
+            # 1st abuse → polite warning (with or without AI)
+            insult = "请文明用语，这条内容不会转发给管理员。"
         await send_msg(user.id, insult)
-        stats_add("abuse_replies")
-        state.update(user.id, msgs_checked=checked, spam_count=spam_c)
-        logger.info(f"ABUSE from {user.id} (classified) → replied")
+        state.update(user.id, msgs_checked=checked, spam_count=spam_c, abuse_count=abuse_c)
+        logger.info(f"ABUSE from {user.id} (classified, abuse #{abuse_c}) → replied")
         return
 
     if label == "SPAM":
@@ -431,13 +443,13 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_msg(user.id, "请注意言辞，再发广告将被拉黑。")
         else:
             stats_add("ads_blocked")
-            await send_msg(user.id, "傻逼")
+            await send_msg(user.id, "傻逼广告")
         state.update(user.id, msgs_checked=checked, spam_count=spam_c)
         logger.info(f"SPAM from {user.id} (AI detected, spam #{spam_c}) → auto-replied")
         return
 
     # === 5. OK → approve and forward ===
-    state.update(user.id, msgs_checked=checked, approved=True, spam_count=spam_c)
+    state.update(user.id, msgs_checked=checked, approved=True, spam_count=spam_c, abuse_count=0)
     logger.info(f"User {user.id} APPROVED")
     await forward_to_owner(user.id, user.full_name, user.username, text)
 
@@ -461,12 +473,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "你直接回复转发的消息即可回复给对方。"
         )
     else:
-        await update.message.reply_text(
-            "👋 你好，这是黑光的消息转发助手。\n\n"
-            "你的留言将会被转发给黑光，他会通过这个机器人回复你。\n"
-            "⚠️ 请勿发送广告或骚扰信息。\n\n"
-            "有什么想说的，直接发过来吧~"
-        )
+        await update.message.reply_text(WELCOME_MSG)
 
 
 async def cmd_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -831,6 +838,21 @@ async def handle_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     uid = msg.from_user.id
 
+    # === Auto-reply text editing mode ===
+    if uid in auto_reply_editing:
+        auto_reply_editing.discard(uid)
+        new_text = msg.text.strip()
+        if len(new_text) > 500:
+            await msg.reply_text("❌ 文案过长（最多500字）")
+            return
+        cfg_ar = load_auto_reply()
+        cfg_ar["text"] = new_text
+        save_auto_reply(cfg_ar)
+        content_ar, markup_ar = build_auto_reply_panel()
+        await msg.reply_text(f"✅ 自动回复文案已更新\n\n" + content_ar, reply_markup=markup_ar, parse_mode="Markdown")
+        logger.info(f"Owner updated auto-reply text: {new_text[:50]}...")
+        return
+
     # === Keyword-adding / Welcome-editing mode ===
     if uid in kw_adding:
         mode = kw_adding.pop(uid)
@@ -1143,12 +1165,13 @@ async def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(CommandHandler("cancel_edit", cmd_cancel_edit))
-    # Remove ReplyKeyboardMarkup menu; owner text is now either a command or a reply to stranger
+    # Owner text: process editing modes first, then reply forwarding
+    # Single handler with explicit priority — editing modes consume, otherwise fall through to reply forwarding
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.User(user_id=OWNER_ID),
-        handle_stranger  # owner non-command text → check if replying to a forwarded msg
+        handle_menu_text
     ), group=0)
-    # Other strangers (group=1, lower priority)
+    # Other strangers
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.User(user_id=OWNER_ID), handle_stranger), group=1)
     app.add_handler(CallbackQueryHandler(handle_callback))
 

@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================
 #  Telegram 消息转发机器人 - 一键搭建 + 多机器人管理脚本
-#  GitHub: https://github.com/dkgks/tg-forwarder
+#  GitHub: https://github.com/dkgks/tgforwarder
 # ============================================================
 set -e
 
@@ -12,7 +12,7 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 INSTALL_DIR="$HOME/tg-forwarder"
-GIT_REPO="https://github.com/dkgks/tg-forwarder.git"
+GIT_REPO="https://github.com/dkgks/tgforwarder.git"
 
 # ============================================================
 print_banner() {
@@ -424,10 +424,11 @@ first_setup() {
     echo -e "${GREEN}  安装完成！${NC}"
     echo -e "${GREEN}========================================${NC}"
     echo ""
-    echo "  管理菜单: bash $INSTALL_DIR/setup.sh"
+    echo "  管理菜单: bash $INSTALL_DIR/tgfwd.sh"
     echo "  手动运行: python3 $INSTALL_DIR/forwarder.py 实例路径/config.json"
     echo "  Bot Token 获取: https://t.me/BotFather"
     echo "  用户ID 获取: https://t.me/userinfobot"
+    echo "  OpenRouter API: https://openrouter.ai"
     echo "  SiliconFlow API: https://siliconflow.cn"
     echo ""
 }
