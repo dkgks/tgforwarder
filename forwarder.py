@@ -56,6 +56,7 @@ INSTANCE_DIR = os.path.dirname(os.path.abspath(CONFIG_PATH))
 STATE_FILE = os.path.join(INSTANCE_DIR, "state.json")
 STATS_FILE = os.path.join(INSTANCE_DIR, "stats.json")
 AUTO_REPLY_FILE = os.path.join(INSTANCE_DIR, "auto_reply.json")
+WELCOME_MSG = cfg.get("welcome_msg", "👋 你好，这是消息转发助手。\n\n你的留言将会被转发给管理员，他会通过这个机器人回复你。\n⚠️ 请勿发送广告或骚扰信息。\n\n有什么想说的，直接发过来吧~")
 KEYWORDS_FILE = os.path.join(INSTANCE_DIR, "keywords.json")
 
 # === Weekly stats (ads blocked + abuse replies) ===
@@ -521,8 +522,7 @@ MENU_INLINE_BOARD = InlineKeyboardMarkup([
     [InlineKeyboardButton("👥 用户列表", callback_data="users_p0"),
      InlineKeyboardButton("📊 统计数据", callback_data="stats")],
     [InlineKeyboardButton("🚫 拉黑列表", callback_data="blocked_p0"),
-     InlineKeyboardButton("🤖 自动回复", callback_data="autoreply")],
-    [InlineKeyboardButton("🔑 屏蔽词管理", callback_data="kw_menu")],
+     InlineKeyboardButton("⚙️ 设置", callback_data="settings")],
     [InlineKeyboardButton("❌ 关闭菜单", callback_data="close_menu")],
 ])
 
@@ -670,6 +670,37 @@ def build_auto_reply_panel():
     return text, markup
 
 
+def build_welcome_panel():
+    """Build welcome message settings panel."""
+    text_lines = [
+        "💬 **欢迎词设置**\n",
+        f"当前欢迎词：\n{WELCOME_MSG}",
+    ]
+    row = [
+        InlineKeyboardButton("✏️ 修改欢迎词(发消息)", callback_data="welcome_edit"),
+    ]
+    row2 = [InlineKeyboardButton("↩ 返回设置", callback_data="settings")]
+    text = "\n".join(text_lines)
+    markup = InlineKeyboardMarkup([row, row2])
+    return text, markup
+
+
+def build_settings_menu():
+    """Settings sub-menu."""
+    kw = load_keywords()
+    na = len(kw.get("abuse", []))
+    ns = len(kw.get("spam", []))
+    text = (
+        "⚙️ **设置**\n\n"
+        "请选择要配置的项："
+    )
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🔑 屏蔽词管理 ({na}+{ns})", callback_data="kw_menu")],
+        [InlineKeyboardButton("💬 欢迎词设置", callback_data="welcome_panel")],
+        [InlineKeyboardButton("🤖 自动回复设置", callback_data="autoreply")],
+        [InlineKeyboardButton("↩ 返回菜单", callback_data="menu")],
+    ])
+    return text, markup
 def build_menu_msg():
     text = (
         "📋 **管理面板**\n\n"
@@ -800,21 +831,35 @@ async def handle_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     uid = msg.from_user.id
 
-    # === Keyword-adding mode ===
+    # === Keyword-adding / Welcome-editing mode ===
     if uid in kw_adding:
-        kind = kw_adding.pop(uid)
-        label = "脏话" if kind == "abuse" else "广告"
-        word = msg.text.strip()
-        if len(word) < 2:
-            await msg.reply_text("❌ 屏蔽词太短（至少2个字）")
+        mode = kw_adding.pop(uid)
+        if mode == "welcome":
+            global WELCOME_MSG
+            new_text = msg.text.strip()
+            if len(new_text) < 2:
+                await msg.reply_text("❌ 欢迎词太短")
+                return
+            WELCOME_MSG = new_text
+            cfg["welcome_msg"] = new_text
+            save_config(cfg)
+            await msg.reply_text(f"✅ 欢迎词已更新")
+            logger.info(f"Owner updated welcome message")
             return
-        if len(word) > 50:
-            await msg.reply_text("❌ 屏蔽词过长（最多50字）")
+        else:
+            kind = mode
+            label = "脏话" if kind == "abuse" else "广告"
+            word = msg.text.strip()
+            if len(word) < 2:
+                await msg.reply_text("❌ 屏蔽词太短（至少2个字）")
+                return
+            if len(word) > 50:
+                await msg.reply_text("❌ 屏蔽词过长（最多50字）")
+                return
+            add_keyword(kind, word)
+            await msg.reply_text(f"✅ 已添加{label}屏蔽词：`{word}`", parse_mode="Markdown")
+            logger.info(f"Owner added {kind} keyword: {word}")
             return
-        add_keyword(kind, word)
-        await msg.reply_text(f"✅ 已添加{label}屏蔽词：`{word}`", parse_mode="Markdown")
-        logger.info(f"Owner added {kind} keyword: {word}")
-        return
 
     # Otherwise: try replying to stranger
     return await handle_stranger(update, context)
@@ -859,6 +904,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
         except Exception as e:
             logger.error(f"Delete message error: {e}")
+        return
+
+    # --- Settings sub-menu ===
+    if data == "settings":
+        content, markup = build_settings_menu()
+        await edit(content, markup)
+        return
+
+    # --- Welcome message ===
+    global WELCOME_MSG
+    if data == "welcome_panel":
+        content, markup = build_welcome_panel()
+        await edit(content, markup)
+        return
+
+    if data == "welcome_edit":
+        kw_adding[query.from_user.id] = "welcome"
+        await edit(
+            "💬 **修改欢迎词**\n\n请在聊天框发送新的欢迎词\n当前欢迎词仅供预览，发送新内容即可替换\n发送 `/cancel_edit` 取消",
+            InlineKeyboardMarkup([[InlineKeyboardButton("↩ 返回设置", callback_data="settings")]])
+        )
         return
 
     # --- Stats and auto-reply from menu ===
