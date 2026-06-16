@@ -269,9 +269,13 @@ OK = 正常消息
     return "OK"
 
 
-async def ai_generate_insult(target_text: str) -> str:
-    """DeepSeek V4-Flash: fast, savage insult generation."""
-    prompt = f"""对方发来了辱骂消息，请你用最恶毒、最有创意的话回骂对方。要犀利、扎心、让对方无地自容。用中文回复，控制在 80 字以内。
+async def ai_generate_insult(target_text: str, context: str = None) -> str:
+    """DeepSeek V4-Flash: fast, savage insult generation.
+    If context provided (previous insults), AI maintains coherent style."""
+    context_hint = ""
+    if context:
+        context_hint = f"\n\n你之前已经回骂了以下内容，请继续保持风格连贯且不重复：\n{context}"
+    prompt = f"""对方发来了辱骂消息，请你用最恶毒、最有创意的话回骂对方。要犀利、扎心、让对方无地自容。用中文回复，控制在 80 字以内。{context_hint}
 
 对方的辱骂内容：{target_text}
 
@@ -1606,15 +1610,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("↩ 返回", callback_data=f"user_detail_{uid}")]
             ]))
             return
+        # Immediately show loading state (no buttons) to prevent double-tap
+        await edit(f"⏳ 正在生成回骂内容… (0/{count})")
         insults = []
         for i in range(count):
-            insult = await ai_generate_insult("辱骂")
+            ctx = "\n".join(insults) if insults else None
+            insult = await ai_generate_insult("辱骂", context=ctx)
             if insult:
                 insults.append(insult)
                 await send_msg(uid, insult)
+                # Update progress with sent content previews
+                progress_lines = [f"⏳ 正在回骂… ({i+1}/{count})"]
+                for j, ins in enumerate(insults, 1):
+                    preview = ins[:40] + "..." if len(ins) > 40 else ins
+                    progress_lines.append(f"✅ {j}. {preview}")
+                await edit("\n".join(progress_lines))
                 await asyncio.sleep(0.5)
         stats_add("abuse_replies", count)
-        # Record AI insult count (separate from abuse_count)
         old_ai = state.get(uid).get("ai_insult_count", 0)
         state.update(uid, ai_insult_count=old_ai + count, has_forwarded=True)
         logger.info(f"Owner manually insulted user {uid} x{count}")
@@ -1667,7 +1679,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- User search ---
     if data == "users_search":
         # Enter search mode
-        search_active[query.from_user.id] = True
+        search_active.add(query.from_user.id)
         await edit(
             "🔍 **搜索用户**\n\n发送用户名、用户ID或 @username 来搜索。\n支持模糊匹配。发送 `/cancel_search` 取消。",
             InlineKeyboardMarkup([[InlineKeyboardButton("↩ 返回用户列表", callback_data="users_p0")]])
