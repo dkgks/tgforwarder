@@ -129,13 +129,13 @@ add_bot() {
             AI_PLATFORM="siliconflow"
             AI_BASE="https://api.siliconflow.cn/v1"
             echo ""
-            echo "  📋 获取 SiliconFlow API Key："
+            echo "  📋 获取 SiliconFlow API 密钥："
             echo "     访问 https://cloud.siliconflow.cn/account/ak"
-            echo -n "  请输入 SiliconFlow API Key: "
+            echo -n "  请输入 SiliconFlow API 密钥: "
             read -r AI_KEY
-            echo -n "  分类模型 [默认 Qwen/Qwen2.5-7B-Instruct]: "
+            echo -n "  分类模型 [默认 deepseek-ai/DeepSeek-V4-Flash]: "
             read -r CLASSIFY_MODEL
-            CLASSIFY_MODEL=${CLASSIFY_MODEL:-Qwen/Qwen2.5-7B-Instruct}
+            CLASSIFY_MODEL=${CLASSIFY_MODEL:-deepseek-ai/DeepSeek-V4-Flash}
             echo -n "  回骂模型 [默认 deepseek-ai/DeepSeek-V4-Flash]: "
             read -r INSULT_MODEL
             INSULT_MODEL=${INSULT_MODEL:-deepseek-ai/DeepSeek-V4-Flash}
@@ -144,10 +144,10 @@ add_bot() {
             AI_PLATFORM="openrouter"
             AI_BASE="https://openrouter.ai/api/v1"
             echo ""
-            echo "  📋 获取 OpenRouter API Key："
+            echo "  📋 获取 OpenRouter API 密钥："
             echo "     访问 https://openrouter.ai/keys"
             echo "     （留空则只能使用免费模型，无需注册）"
-            echo -n "  请输入 OpenRouter API Key [可留空]: "
+            echo -n "  请输入 OpenRouter API 密钥 [可留空]: "
             read -r AI_KEY
 
             echo ""
@@ -428,8 +428,8 @@ first_setup() {
     echo "  手动运行: python3 $INSTALL_DIR/forwarder.py 实例路径/config.json"
     echo "  Bot Token 获取: https://t.me/BotFather"
     echo "  用户ID 获取: https://t.me/userinfobot"
-    echo "  OpenRouter API: https://openrouter.ai"
-    echo "  SiliconFlow API: https://siliconflow.cn"
+    echo "  OpenRouter API 密钥: https://openrouter.ai"
+    echo "  SiliconFlow API 密钥: https://siliconflow.cn"
     echo ""
 }
 

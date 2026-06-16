@@ -14,7 +14,7 @@ Features:
 - Blocked user management, auto-reply, keyword management
 """
 
-import asyncio, json, logging, os, signal, sys
+import asyncio, json, logging, os, signal, sys, time
 import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
@@ -44,8 +44,11 @@ cfg = load_config()
 NEW_BOT_TOKEN = cfg["bot_token"]
 OWNER_ID = cfg["owner_id"]
 
-AI_ENABLED = cfg.get("ai", {}).get("enabled", False)
-AI_API_KEY = cfg.get("ai", {}).get("api_key", "")
+ai_cfg = cfg.get("ai", {})
+AI_AUTO_ENABLED = (ai_cfg.get("api_key", "").strip() != "")
+AI_ABUSE_MANUAL_OFF = ai_cfg.get("abuse_manual_off", False)
+AI_ENABLED = AI_AUTO_ENABLED and not AI_ABUSE_MANUAL_OFF
+AI_API_KEY = ai_cfg.get("api_key", "")
 AI_BASE_URL = cfg.get("ai", {}).get("base_url", "https://api.siliconflow.cn/v1")
 AI_PLATFORM = cfg.get("ai", {}).get("platform", "openrouter")  # siliconflow or openrouter
 CLASSIFY_MODEL = cfg.get("ai", {}).get("classify_model", "qwen/qwen3-next-80b-a3b-instruct:free")
@@ -126,7 +129,11 @@ class State:
         return self.users.get(uid, {"msgs_checked": 0, "approved": False, "spam_count": 0,
                                     "full_name": "", "username": "", "first_seen": "",
                                     "blocked": False, "auto_reply_used": 0,
-                                    "abuse_count": 0})
+                                                                        "abuse_count": 0, "has_forwarded": False,
+                                    "last_fwd_msg_id": 0, "last_active": "",
+                                    "ai_insult_count": 0})
+
+
 
     def update(self, uid, **kw):
         entry = self.get(uid)
@@ -254,6 +261,9 @@ OK = 正常消息
                     if lbl in ans:
                         return lbl
                 return "OK"
+            elif r.status_code in (401, 403):
+                logger.error(f"AI classify token invalid (HTTP {r.status_code}), disabling AI")
+                await _disable_ai_due_to_auth()
     except Exception as e:
         logger.error(f"AI classify error: {e}")
     return "OK"
@@ -283,9 +293,63 @@ async def ai_generate_insult(target_text: str) -> str:
             )
             if r.status_code == 200:
                 return r.json()["choices"][0]["message"]["content"].strip()
+            elif r.status_code in (401, 403):
+                logger.error(f"AI insult token invalid (HTTP {r.status_code}), disabling AI")
+                await _disable_ai_due_to_auth()
     except Exception as e:
         logger.error(f"AI insult error: {e}")
     return "你这种人活着就是浪费空气。"
+
+
+async def _disable_ai_due_to_auth():
+    """Notify owner about invalid AI token, keep fallback behavior."""
+    err_msg = (
+        "⚠️ **AI API 鉴权失败**\n\n"
+        "AI token 返回了 401/403 错误，AI 分类和回骂功能暂时使用兜底逻辑。\n"
+        "消息分类将默认为 OK，回骂将使用预设文本。\n"
+        "请检查并更新 token。"
+    )
+    await send_msg(OWNER_ID, err_msg)
+    logger.warning("AI auth failure, owner notified (keeping fallbacks)")
+
+
+# Cached AI self-check result: None=unchecked, True=valid, False=invalid
+_last_ai_check = None  # (valid, timestamp)
+async def check_ai_token() -> str:
+    """Lightweight AI token health check. Returns 'valid', 'invalid', or 'unchecked'."""
+    global _last_ai_check
+    if not AI_ENABLED:
+        # If manually disabled, show appropriate status
+        if not AI_AUTO_ENABLED:
+            return "no_token"
+        if AI_ABUSE_MANUAL_OFF:
+            return "manually_off"
+        return "disabled"
+    # Use cached result if within 5 minutes
+    if _last_ai_check:
+        valid, ts = _last_ai_check
+        if time.time() - ts < 300:
+            return "valid" if valid else "invalid"
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.post(
+                f"{AI_BASE_URL}/chat/completions",
+                headers={"Authorization": f"Bearer {AI_API_KEY}"},
+                json={
+                    "model": INSULT_MODEL,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 1
+                }
+            )
+            if r.status_code == 200:
+                _last_ai_check = (True, time.time())
+                return "valid"
+            if r.status_code in (401, 403):
+                _last_ai_check = (False, time.time())
+                return "invalid"
+    except Exception:
+        pass
+    return "unchecked"
 
 
 async def send_msg(chat_id: int, text: str) -> bool:
@@ -302,11 +366,17 @@ async def send_msg(chat_id: int, text: str) -> bool:
     return False
 
 
-async def forward_to_owner(uid: int, name: str, username: str, text: str):
-    """Forward legit message to owner."""
+async def forward_to_owner(uid: int, name: str, username: str, text: str,
+                              spam_count: int = 0, abuse_count: int = 0) -> int:
+    """Forward legit message. Returns Telegram message_id or 0 on failure."""
     uname = f" @{username}" if username else ""
-    msg = f"📩 **{name}**{uname}\n🆔 `{uid}`\n\n{text[:3500]}"
-
+    tags = []
+    if spam_count > 0:
+        tags.append(f"🛡️广告×{spam_count}")
+    if abuse_count > 0:
+        tags.append(f"🤬脏话×{abuse_count}")
+    tag_line = " " + " ".join(tags) if tags else ""
+    msg = f"📩 **{name}**{uname}\n🆔 `{uid}`{tag_line}\n\n{text[:3500]}"
     try:
         async with httpx.AsyncClient(timeout=15) as c:
             r = await c.post(
@@ -319,8 +389,45 @@ async def forward_to_owner(uid: int, name: str, username: str, text: str):
                     fwd_id = data["result"]["message_id"]
                     reply_map[fwd_id] = uid
                     logger.info(f"Forwarded to owner msg#{fwd_id} ← user {uid}")
+                    return fwd_id
     except Exception as e:
         logger.error(f"Forward to owner error: {e}")
+    return 0
+
+
+async def tag_forwarded_message(fwd_msg_id: int, tag: str, original_text: str = ""):
+    """Edit a forwarded message to append a tag at the end.
+    If original_text is provided, appends tag to it. Otherwise sends a separate notification."""
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            if original_text:
+                new_text = original_text + "\n\n" + tag
+            else:
+                # No original text available - send a separate notification
+                r = await c.post(
+                    f"https://api.telegram.org/bot{NEW_BOT_TOKEN}/sendMessage",
+                    json={"chat_id": OWNER_ID, "text": tag,
+                          "reply_to_message_id": fwd_msg_id}
+                )
+                if r.status_code == 200:
+                    logger.info(f"Tagged msg#{fwd_msg_id} via reply with '{tag}'")
+                else:
+                    logger.warning(f"Failed to tag msg#{fwd_msg_id}")
+                return
+            r = await c.post(
+                f"https://api.telegram.org/bot{NEW_BOT_TOKEN}/editMessageText",
+                json={
+                    "chat_id": OWNER_ID,
+                    "message_id": fwd_msg_id,
+                    "text": new_text[:4000]
+                }
+            )
+            if r.status_code != 200:
+                logger.warning(f"Failed to edit msg#{fwd_msg_id}, sent separate message")
+            else:
+                logger.info(f"Tagged msg#{fwd_msg_id} with '{tag}'")
+    except Exception as e:
+        logger.error(f"tag_forwarded_message error: {e}")
 
 
 async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -330,53 +437,50 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = msg.from_user
     if user.id == OWNER_ID:
-        # Owner reply check
         reply = msg.reply_to_message
         if reply and reply.message_id in reply_map:
             sid = reply_map.pop(reply.message_id)
             await send_msg(sid, msg.text)
             logger.info(f"Owner replied to stranger {sid}")
-            # Auto-approve user that owner replied to
             if sid in state.users:
                 state.update(sid, approved=True)
                 logger.info(f"Auto-approved user {sid} (owner replied)")
         return
 
     text = msg.text
-
-    # Ensure user record exists with name info
     us = state.ensure_user(user.id, user.full_name or "", user.username or "")
 
-    # === 0. Blocked user check ===
     if us.get("blocked"):
         await send_msg(user.id, "你已被拉黑")
-        logger.info(f"Blocked user {user.id} attempted message → replied '你已被拉黑'")
+        logger.info(f"Blocked user {user.id} attempted message")
         return
 
-    checked = us.get("msgs_checked", 0)
     spam_c = us.get("spam_count", 0)
 
-    # === 1. Fast local pre-check for abuse keywords ===
+    # === 1. Local ABUSE check ===
     local = local_check(text)
     if local == "ABUSE":
-        # Cumulative abuse count from user state
         abuse_c = us.get("abuse_count", 0) + 1
-        checked += 1
+        checked = 0  # reset continuous count
         if AI_ENABLED and abuse_c >= 2:
-            # 2nd+ abuse → AI insult
             insult = await ai_generate_insult(text)
             stats_add("abuse_replies")
+            old_ai = us.get("ai_insult_count", 0)
+            state.update(user.id, ai_insult_count=old_ai + 1)
+            if us.get("has_forwarded") and us.get("last_fwd_msg_id"):
+                await tag_forwarded_message(us["last_fwd_msg_id"], "⚠️ 已启动AI自动回骂")
         else:
-            # 1st abuse → polite warning (with or without AI)
             insult = "请文明用语，这条内容不会转发给管理员。"
         await send_msg(user.id, insult)
-        state.update(user.id, msgs_checked=checked, spam_count=spam_c, abuse_count=abuse_c)
+        state.update(user.id, msgs_checked=checked, spam_count=spam_c, abuse_count=abuse_c,
+                     last_active=datetime_iso())
         logger.info(f"ABUSE from {user.id} (local hit, abuse #{abuse_c}) → replied")
         return
 
-    # === 2. Fast local pre-check for spam keywords ===
+    # === 2. Local SPAM check ===
     if local == "SPAM":
         spam_c += 1
+        checked = 0  # reset continuous count
         if spam_c == 1:
             stats_add("ads_blocked")
             await send_msg(user.id, "请勿发送广告。")
@@ -386,20 +490,21 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             stats_add("ads_blocked")
             await send_msg(user.id, "傻逼广告")
-        checked += 1
-        state.update(user.id, msgs_checked=checked, spam_count=spam_c)
+        state.update(user.id, msgs_checked=checked, spam_count=spam_c, last_active=datetime_iso())
         logger.info(f"SPAM from {user.id} (local hit, spam #{spam_c}) → auto-replied")
         return
 
-    # === 3. Approved user, no local hit → forward directly ===
+    # === 3. Approved user → forward ===
     if us.get("approved"):
-        checked += 1
-        logger.info(f"User {user.id} msg#{checked}/10 → OK (approved): {text[:100]}")
-        # Reset abuse_count on normal message (breaks consecutive chain)
-        state.update(user.id, msgs_checked=checked, spam_count=spam_c, abuse_count=0)
-        await forward_to_owner(user.id, user.full_name, user.username, text)
-
-        # Auto-reply for approved users (if enabled and count not exhausted)
+        checked = us.get("msgs_checked", 0) + 1
+        old_abuse = us.get("abuse_count", 0)
+        state.update(user.id, msgs_checked=checked, spam_count=spam_c,
+                     last_active=datetime_iso())
+        fwd_id = await forward_to_owner(user.id, user.full_name, user.username, text,
+                                        spam_c, old_abuse)
+        if fwd_id:
+            state.update(user.id, has_forwarded=True, last_fwd_msg_id=fwd_id)
+        logger.info(f"Approved user {user.id} msg → forwarded")
         auto_cfg = load_auto_reply()
         if auto_cfg.get("enabled"):
             max_cnt = auto_cfg.get("max_count", 1)
@@ -407,34 +512,38 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if used < max_cnt:
                 await send_msg(user.id, auto_cfg["text"])
                 state.update(user.id, auto_reply_used=used + 1)
-                logger.info(f"Auto-reply #{used+1}/{max_cnt} to user {user.id}")
         return
 
-    # === 4. Not approved, no local hit → classify ===
+    # === 4. Not approved → AI classify ===
+    checked = us.get("msgs_checked", 0)
     if AI_ENABLED:
         label = await ai_classify(text)
     else:
-        label = "OK"  # Without AI, treat unclassified messages as legitimate
+        label = "OK"
     checked += 1
-    logger.info(f"User {user.id} msg#{checked}/10 → {label}: {text[:100]}")
+    logger.info(f"User {user.id} msg#{checked} → {label}: {text[:100]}")
 
     if "ABUSE" in label:
-        # Cumulative abuse count from user state
         abuse_c = us.get("abuse_count", 0) + 1
+        checked = 0
         if AI_ENABLED and abuse_c >= 2:
-            # 2nd+ abuse → AI insult
             insult = await ai_generate_insult(text)
             stats_add("abuse_replies")
+            old_ai = us.get("ai_insult_count", 0)
+            state.update(user.id, ai_insult_count=old_ai + 1)
+            if us.get("has_forwarded") and us.get("last_fwd_msg_id"):
+                await tag_forwarded_message(us["last_fwd_msg_id"], "⚠️ 已启动AI自动回骂")
         else:
-            # 1st abuse → polite warning (with or without AI)
             insult = "请文明用语，这条内容不会转发给管理员。"
         await send_msg(user.id, insult)
-        state.update(user.id, msgs_checked=checked, spam_count=spam_c, abuse_count=abuse_c)
-        logger.info(f"ABUSE from {user.id} (classified, abuse #{abuse_c}) → replied")
+        state.update(user.id, msgs_checked=checked, spam_count=spam_c, abuse_count=abuse_c,
+                     last_active=datetime_iso())
+        logger.info(f"ABUSE from {user.id} (AI, abuse #{abuse_c}) → replied")
         return
 
     if label == "SPAM":
         spam_c += 1
+        checked = 0
         if spam_c == 1:
             stats_add("ads_blocked")
             await send_msg(user.id, "请勿发送广告。")
@@ -444,19 +553,24 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             stats_add("ads_blocked")
             await send_msg(user.id, "傻逼广告")
-        state.update(user.id, msgs_checked=checked, spam_count=spam_c)
-        logger.info(f"SPAM from {user.id} (AI detected, spam #{spam_c}) → auto-replied")
+        state.update(user.id, msgs_checked=checked, spam_count=spam_c, last_active=datetime_iso())
+        logger.info(f"SPAM from {user.id} (AI, spam #{spam_c}) → auto-replied")
         return
 
-    # === 5. OK → approve and forward ===
-    state.update(user.id, msgs_checked=checked, spam_count=spam_c, abuse_count=0)
-    logger.info(f"User {user.id} msg#{checked}/10 → OK")
+    # === 5. OK → forward ===
+    old_abuse = us.get("abuse_count", 0)
+    state.update(user.id, spam_count=spam_c, last_active=datetime_iso())
     if checked >= 10:
-        state.update(user.id, approved=True)
-        logger.info(f"User {user.id} APPROVED")
-    await forward_to_owner(user.id, user.full_name, user.username, text)
+        state.update(user.id, approved=True, msgs_checked=checked)
+        logger.info(f"User {user.id} APPROVED (continuous {checked} OK)")
+    else:
+        state.update(user.id, msgs_checked=checked)
+    fwd_id = await forward_to_owner(user.id, user.full_name, user.username, text,
+                                    spam_c, old_abuse)
+    if fwd_id:
+        state.update(user.id, has_forwarded=True, last_fwd_msg_id=fwd_id)
+    logger.info(f"User {user.id} OK → forwarded")
 
-    # Auto-reply for newly approved user
     auto_cfg = load_auto_reply()
     if auto_cfg.get("enabled"):
         max_cnt = auto_cfg.get("max_count", 1)
@@ -464,7 +578,6 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if used < max_cnt:
             await send_msg(user.id, auto_cfg["text"])
             state.update(user.id, auto_reply_used=used + 1)
-            logger.info(f"Auto-reply #{used+1}/{max_cnt} to new user {user.id}")
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -516,9 +629,10 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif u.get("approved"):
             status = "✅ 已批准"
         else:
-            status = f"🔍 过滤中({u.get('msgs_checked',0)}/10)"
+            status = f"🔍 审核中({u.get('msgs_checked',0)}/10)"
         spam = f" 🛡️×{u.get('spam_count',0)}" if u.get('spam_count', 0) > 0 else ""
-        lines.append(f"`{uid}` {name}{uname} — {status}{spam}")
+        abuse = f" 🤬×{u.get('abuse_count',0)}" if u.get('abuse_count', 0) > 0 else ""
+        lines.append(f"`{uid}` {name}{uname} — {status}{spam}{abuse}")
     await msg.reply_text(f"📊 追踪用户 ({len(state.users)})：\n" + "\n".join(lines[:30]), parse_mode="Markdown")
 
 
@@ -538,16 +652,19 @@ MENU_INLINE_BOARD = InlineKeyboardMarkup([
 
 
 def build_user_list(page=0):
-    """Build user list with inline buttons for owner."""
+    """Two-tier user list: each user is a button to open detail panel."""
     users = list(state.users.items())
+    # Sort by last_active descending (newly active first), empty strings last
+    users.sort(key=lambda x: x[1].get("last_active", "") or "0000", reverse=True)
     total_pages = max(1, (len(users) + USERS_PER_PAGE - 1) // USERS_PER_PAGE)
     page = max(0, min(page, total_pages - 1))
     start = page * USERS_PER_PAGE
     end = start + USERS_PER_PAGE
 
     text_lines = [f"👥 **用户列表** ({len(users)}人) 第{page+1}/{total_pages}页\n"]
-    keyboard_rows = []
+    text_lines.append("🔍 点击用户名查看详情和操作：\n")
 
+    idx = start + 1
     for uid, u in users[start:end]:
         name = u.get("full_name", "") or u.get("username", "") or f"ID:{uid}"
         uname = f" (@{u['username']})" if u.get("username") else ""
@@ -556,37 +673,40 @@ def build_user_list(page=0):
         elif u.get("approved"):
             st = "✅ 已批准"
         else:
-            st = f"🔍 审核中({u.get('msgs_checked',0)}/10)"
-        spam = f" 🛡️×{u.get('spam_count',0)}" if u.get('spam_count', 0) > 0 else ""
-        text_lines.append(f"• {name}{uname} — `{uid}` — {st}{spam}")
+            st = f"🔍 审核中({u.get('msgs_checked',0)}/10连续)"
+        spam_s = u.get("spam_count", 0)
+        abuse_s = u.get("abuse_count", 0)
+        has_fwd = u.get("has_forwarded", False)
+        tags = []
+        if spam_s > 0:
+            tags.append(f"🛡️广告×{spam_s}")
+        if abuse_s > 0:
+            tags.append(f"🤬脏话×{abuse_s}")
+        if u.get("ai_insult_count", 0) > 0:
+            tags.append(f"⚡AI回骂×{u.get('ai_insult_count', 0)}")
+        tag_part = " | " + " ".join(tags) if tags else ""
+        text_lines.append(f"{idx}. {name}{uname}\n   🆔 `{uid}` | {st}{tag_part}\n")
+        idx += 1
 
-        # Action buttons per user
-        btns = []
-        if u.get("blocked"):
-            btns.append(InlineKeyboardButton(f"🔓 解封 {uid}", callback_data=f"unblock_{uid}"))
-        else:
-            if not u.get("approved"):
-                btns.append(InlineKeyboardButton(f"✅ 批准 {uid}", callback_data=f"approve_{uid}"))
-            btns.append(InlineKeyboardButton(f"🚫 拉黑 {uid}", callback_data=f"block_{uid}"))
-        btns.append(InlineKeyboardButton(f"🔄 重置 {uid}", callback_data=f"reset_{uid}"))
-        keyboard_rows.append(btns)
+    btn_rows = []
+    for uid, u in users[start:end]:
+        name = u.get("full_name", "") or u.get("username", "") or f"ID:{uid}"
+        btn_rows.append([InlineKeyboardButton(f"{name} (ID:{uid})", callback_data=f"user_detail_{uid}")])
 
-    # Pagination row
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton("◀ 上一页", callback_data=f"users_p{page-1}"))
     if page < total_pages - 1:
         nav.append(InlineKeyboardButton("下一页 ▶", callback_data=f"users_p{page+1}"))
     if nav:
-        keyboard_rows.append(nav)
+        btn_rows.append(nav)
 
-    # Back to menu
-    keyboard_rows.append([InlineKeyboardButton("↩ 返回菜单", callback_data="menu")])
+    btn_rows.append([InlineKeyboardButton("🔍 搜索用户", callback_data="users_search")])
+    btn_rows.append([InlineKeyboardButton("↩ 返回菜单", callback_data="menu")])
 
     text = "\n".join(text_lines)
-    markup = InlineKeyboardMarkup(keyboard_rows)
+    markup = InlineKeyboardMarkup(btn_rows)
     return text, markup
-
 
 def build_blocked_list(page=0):
     """Build blocked users list."""
@@ -708,14 +828,103 @@ def build_settings_menu():
         [InlineKeyboardButton(f"🔑 屏蔽词管理 ({na}+{ns})", callback_data="kw_menu")],
         [InlineKeyboardButton("💬 欢迎词设置", callback_data="welcome_panel")],
         [InlineKeyboardButton("🤖 自动回复设置", callback_data="autoreply")],
+        [InlineKeyboardButton("🤖 AI 设置", callback_data="ai_settings")],
+        [InlineKeyboardButton("🗑 一键清空所有用户", callback_data="clearall_confirm")],
         [InlineKeyboardButton("↩ 返回菜单", callback_data="menu")],
     ])
     return text, markup
-def build_menu_msg():
+
+
+def build_ai_settings():
+    """AI settings panel - status, toggle, API key, models."""
+    auto_abuse = not AI_ABUSE_MANUAL_OFF
+    # Status line: read cached check result
+    status_line = "🤖 AI 服务：⚠️ 未验证（请点击测试）"
+    if AI_AUTO_ENABLED:
+        if _last_ai_check:
+            valid, _ = _last_ai_check
+            status_line = "🤖 AI 服务：✅ 正常" if valid else "🤖 AI 服务：❌ 密钥无效"
+    else:
+        status_line = "🤖 AI 服务：❌ 未配置密钥"
     text = (
-        "📋 **管理面板**\n\n"
-        "请点击下方按钮选择操作："
+        "🤖 **AI 设置**\n\n"
+        f"{status_line}\n"
+        f"🤬 自动回骂：{'✅ 已开启' if auto_abuse else '❌ 已关闭'}\n\n"
+        "请选择操作："
     )
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔍 测试 AI 连接", callback_data="check_ai_status")],
+        [InlineKeyboardButton(
+            f"🤬 自动回骂：{'关闭' if auto_abuse else '开启'}",
+            callback_data="toggle_abuse"
+        )],
+        [InlineKeyboardButton("🔑 API 密钥管理", callback_data="ai_apikey_panel")],
+        [InlineKeyboardButton("🧠 自定义模型", callback_data="ai_model_panel")],
+        [InlineKeyboardButton("↩ 返回菜单", callback_data="menu")],
+    ])
+    return text, markup
+
+
+def build_ai_apikey_panel():
+    """API key management panel - shows masked key, allows editing."""
+    api_key = cfg.get("ai", {}).get("api_key", "")
+    masked = "***" + api_key[-4:] if len(api_key) > 4 else "（未设置）"
+    platform = cfg.get("ai", {}).get("platform", "unknown")
+    text = (
+        "🔑 API 密钥管理\n\n"
+        f"平台：{platform}\n"
+        f"当前密钥：{masked}\n\n"
+        "点击下方按钮修改密钥，或回复 /ai_setkey <新密钥>"
+    )
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ 修改密钥（输入模式）", callback_data="ai_setkey_mode")],
+        [InlineKeyboardButton("↩ 返回 AI 设置", callback_data="ai_settings")],
+    ])
+    return text, markup
+
+
+def build_ai_model_panel():
+    """Model customization panel."""
+    classify_model = cfg.get("ai", {}).get("classify_model", "未设置")
+    insult_model = cfg.get("ai", {}).get("insult_model", "未设置")
+    text = (
+        "🧠 **自定义模型**\n\n"
+        f"分类模型：{classify_model}\n"
+        f"回骂模型：{insult_model}\n\n"
+        "修改模型请用命令行：\n"
+        "`/ai_classify_model <模型名>`\n"
+        "`/ai_insult_model <模型名>`"
+    )
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("↩ 返回 AI 设置", callback_data="ai_settings")],
+    ])
+    return text, markup
+
+
+def build_clearall_confirm():
+    """Clear all users confirmation panel."""
+    total = len(state.users)
+    text = (
+        f"🗑 **确认清空所有用户记录？**\n\n"
+        f"将删除全部 **{total}** 个用户的所有数据。\n"
+        f"确认后不可恢复！"
+    )
+    markup = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ 确认清空", callback_data="clearall_do"),
+            InlineKeyboardButton("❌ 取消", callback_data="settings"),
+        ]
+    ])
+    return text, markup
+def build_menu_msg(extra=""):
+    lines = [
+        "📋 **管理面板**",
+        "",
+    ]
+    if extra:
+        lines.append(extra)
+    lines.append("请点击下方按钮选择操作：")
+    text = "\n".join(lines)
     return text
 
 
@@ -823,6 +1032,134 @@ def build_kw_del_view(kind: str, page: int):
 kw_adding: dict[int, str] = {}
 
 
+def build_user_detail(uid: int):
+    """Build user detail panel with action buttons."""
+    u = state.get(uid)
+    name = u.get("full_name", "") or u.get("username", "") or "未知"
+    uname = f" (@{u['username']})" if u.get("username") else ""
+    blocked = u.get("blocked", False)
+    approved = u.get("approved", False)
+    spam_c = u.get("spam_count", 0)
+    abuse_c = u.get("abuse_count", 0)
+    checked = u.get("msgs_checked", 0)
+    first = u.get("first_seen", "未知")[:10]
+    last = u.get("last_active", "未知")[:10]
+    has_fwd = u.get("has_forwarded", False)
+    ai_insult_c = u.get("ai_insult_count", 0)
+
+    if blocked:
+        status = "🚫 已拉黑"
+    elif approved:
+        status = "✅ 已批准"
+    else:
+        status = f"🔍 审核中({checked}/10连续)"
+
+    lines = [
+        f"👤 **{name}**{uname}\n",
+        f"🆔 `{uid}`",
+        f"状态：{status}",
+        f"📩 连续正常：{checked} 条",
+        f"🛡️ 广告拦截：{spam_c} 条",
+        f"🤬 脏话拦截：{abuse_c} 条",
+        f"📤 已转发：{'是' if has_fwd else '否'}",
+        f"⚡ AI回骂次数：{ai_insult_c} 次",
+        f"📅 首次出现：{first}",
+        f"🕐 最后活跃：{last}",
+        f"\n操作：",
+    ]
+
+    rows = []
+    if not blocked:
+        if not approved:
+            rows.append([InlineKeyboardButton("✅ 批准", callback_data=f"approve_{uid}")])
+        rows.append([InlineKeyboardButton("🚫 拉黑", callback_data=f"block_{uid}")])
+    else:
+        rows.append([InlineKeyboardButton("🔓 解封", callback_data=f"unblock_{uid}")])
+    rows.append([
+        InlineKeyboardButton("🔄 重置", callback_data=f"reset_{uid}"),
+        InlineKeyboardButton("🤬 一键回骂", callback_data=f"insult_confirm_{uid}"),
+    ])
+    rows.append([
+        InlineKeyboardButton("🗑 删除用户", callback_data=f"delete_confirm_{uid}"),
+    ])
+    rows.append([InlineKeyboardButton("↩ 返回用户列表", callback_data="users_p0")])
+
+    text = "\n".join(lines)
+    markup = InlineKeyboardMarkup(rows)
+    return text, markup
+
+
+def build_delete_confirm(uid: int):
+    """Delete user confirmation panel."""
+    u = state.get(uid)
+    name = u.get("full_name", "") or u.get("username", "") or f"ID:{uid}"
+
+    text = (
+        f"🗑 **确认删除 {name}（{uid}）？**\n\n"
+        f"将删除该用户的所有记录数据。\n"
+        f"确认后不可恢复。"
+    )
+    markup = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ 确认删除", callback_data=f"delete_do_{uid}"),
+            InlineKeyboardButton("❌ 取消", callback_data=f"user_detail_{uid}"),
+        ]
+    ])
+    return text, markup
+
+
+def build_insult_confirm(uid: int):
+    """Insult confirmation panel with count selection and AI check."""
+    u = state.get(uid)
+    name = u.get("full_name", "") or u.get("username", "") or f"ID:{uid}"
+
+    if not AI_ENABLED:
+        text = (
+            "❌ **需要先配置 AI**\n\n"
+            "回骂功能需要开启 AI 并配置 API 密钥。\n"
+            "请前往设置 → AI 设置中配置。"
+        )
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("↩ 返回", callback_data=f"user_detail_{uid}")]
+        ])
+        return text, markup
+
+    text = (
+        f"🤬 **一键回骂 {name}（{uid}）**\n\n"
+        f"选择回骂条数（1-5条），AI 将逐条生成并发送。"
+    )
+    markup = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("1条", callback_data=f"insult_confirm2_{uid}_1"),
+            InlineKeyboardButton("2条", callback_data=f"insult_confirm2_{uid}_2"),
+            InlineKeyboardButton("3条", callback_data=f"insult_confirm2_{uid}_3"),
+        ],
+        [
+            InlineKeyboardButton("4条", callback_data=f"insult_confirm2_{uid}_4"),
+            InlineKeyboardButton("5条", callback_data=f"insult_confirm2_{uid}_5"),
+            InlineKeyboardButton("❌ 取消", callback_data=f"user_detail_{uid}"),
+        ]
+    ])
+    return text, markup
+
+
+def build_insult_confirm2(uid: int, count: int):
+    """Second-layer confirmation before actually sending insults."""
+    u = state.get(uid)
+    name = u.get("full_name", "") or u.get("username", "") or f"ID:{uid}"
+    text = (
+        f"🤬 **确认回骂 {name}（{uid}） ×{count}条？**\n\n"
+        f"AI 将逐条生成并发送，确认后不可撤回。"
+    )
+    markup = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(f"✅ 确认发送 {count}条", callback_data=f"insult_send_{uid}_{count}"),
+            InlineKeyboardButton("❌ 取消", callback_data=f"user_detail_{uid}"),
+        ]
+    ])
+    return text, markup
+
+
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Owner: /menu to show management panel with inline buttons."""
     msg = update.message
@@ -833,6 +1170,7 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Owner text: either keyword-adding mode or reply forwarding."""
+    global AI_AUTO_ENABLED, AI_ENABLED, AI_ABUSE_MANUAL_OFF, cfg
     msg = update.message
     if not msg or not msg.text:
         return
@@ -840,6 +1178,65 @@ async def handle_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     uid = msg.from_user.id
+
+    # === User search mode ===
+    if uid in search_active:
+        search_active.discard(uid)
+        query_text = msg.text.strip()
+        if query_text in ("/cancel", "取消"):
+            await msg.reply_text("✅ 已取消搜索")
+            return
+        # Search users
+        matches = []
+        q = query_text.lower()
+        for suid, u in state.users.items():
+            name = (u.get("full_name", "") or u.get("username", "") or "").lower()
+            uname = (u.get("username", "") or "").lower()
+            if q in name or q in uname or str(suid) == query_text:
+                matches.append(suid)
+        if not matches:
+            await msg.reply_text(f"❌ 未找到匹配 '**{query_text}**' 的用户", parse_mode="Markdown",
+                               reply_markup=InlineKeyboardMarkup([
+                                   [InlineKeyboardButton("↩ 返回用户列表", callback_data="users_p0")]
+                               ]))
+            return
+        if len(matches) == 1:
+            content, markup = build_user_detail(matches[0])
+            await msg.reply_text(content, reply_markup=markup, parse_mode="Markdown")
+            return
+        # Multiple matches
+        lines = [f"🔍 搜索 '**{query_text}**' — 找到 {len(matches)} 人\n\n请选择："]
+        btns = []
+        for suid in matches[:10]:
+            u = state.get(suid)
+            name = u.get("full_name", "") or u.get("username", "") or f"ID:{suid}"
+            btns.append([InlineKeyboardButton(f"{name} (ID:{suid})", callback_data=f"user_detail_{suid}")])
+        btns.append([InlineKeyboardButton("↩ 返回用户列表", callback_data="users_p0")])
+        await msg.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(btns), parse_mode="Markdown")
+        return
+
+    # === AI API key input mode ===
+    if uid in ai_setkey_waiting:
+        ai_setkey_waiting.discard(uid)
+        new_key = msg.text.strip()
+        if new_key in ("/cancel", "取消"):
+            await msg.reply_text("✅ 已取消密钥修改")
+            return
+        if not new_key or len(new_key) < 3:
+            await msg.reply_text("❌ 密钥无效（太短），请重试")
+            return
+        cfg["ai"]["api_key"] = new_key
+        save_config(cfg)
+        AI_AUTO_ENABLED = (new_key.strip() != "")
+        AI_ENABLED = AI_AUTO_ENABLED and not AI_ABUSE_MANUAL_OFF
+        await msg.reply_text(
+            f"✅ AI API 密钥已更新\n\nAI 自动启用：{'✅' if AI_ENABLED else '❌'}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("↩ 返回 AI 设置", callback_data="ai_settings")]
+            ])
+        )
+        logger.info("Owner updated AI API key")
+        return
 
     # === Auto-reply text editing mode ===
     if uid in auto_reply_editing:
@@ -893,11 +1290,17 @@ async def handle_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Track which owner is editing auto-reply text
 auto_reply_editing: set[int] = set()
 
+# Track which owner is in search mode
+search_active: set[int] = set()
+# Track which owner is waiting for API key input
+ai_setkey_waiting: set[int] = set()
+
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle all inline button callbacks from owner."""
+    global AI_ABUSE_MANUAL_OFF, AI_ENABLED, cfg, _last_ai_check, ai_setkey_waiting
     query = update.callback_query
-    await query.answer()  # Acknowledge button press
+    logger.info(f"Callback query received: data={query.data}, from={query.from_user.id}")
 
     if query.from_user.id != OWNER_ID:
         await query.edit_message_text("❌ 仅主人可操作")
@@ -910,16 +1313,26 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Helper to edit current message
     async def edit(text, markup=None):
         try:
+            has_md = any(c in text for c in ('*', '_', '`', '~'))
             await context.bot.edit_message_text(
                 text, chat_id=chat_id, message_id=msg_id,
-                reply_markup=markup, parse_mode="Markdown"
+                reply_markup=markup,
+                parse_mode="Markdown" if has_md else None
             )
         except Exception as e:
             logger.error(f"Edit message error: {e}")
+            # Fallback: try without parse_mode
+            try:
+                await context.bot.edit_message_text(
+                    text, chat_id=chat_id, message_id=msg_id,
+                    reply_markup=markup,
+                    parse_mode=None
+                )
+            except Exception as e2:
+                logger.error(f"Edit message fallback error: {e2}")
 
     # --- Menu navigation ---
     if data == "menu":
-        # Edit current message back to main inline menu
         await edit(build_menu_msg(), MENU_INLINE_BOARD)
         return
 
@@ -932,8 +1345,90 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # --- Settings sub-menu ===
+    # --- AI settings ---
+    if data == "ai_settings":
+        # Auto-check AI connection on first visit (cache empty)
+        if AI_AUTO_ENABLED and _last_ai_check is None:
+            try:
+                await check_ai_token()
+            except Exception as e:
+                logger.error(f"check_ai_token error in ai_settings: {e}")
+        content, markup = build_ai_settings()
+        await edit(content, markup)
+        return
+
     if data == "settings":
         content, markup = build_settings_menu()
+        await edit(content, markup)
+        return
+
+    # --- Toggle AI auto-abuse ---
+    if data == "toggle_abuse":
+        if not AI_AUTO_ENABLED:
+            await query.answer("❌ 未配置 AI API 密钥，无法开启", show_alert=True)
+            return
+        AI_ABUSE_MANUAL_OFF = not AI_ABUSE_MANUAL_OFF
+        AI_ENABLED = AI_AUTO_ENABLED and not AI_ABUSE_MANUAL_OFF
+        cfg["ai"]["abuse_manual_off"] = AI_ABUSE_MANUAL_OFF
+        save_config(cfg)
+        await query.answer(
+            f"🤬 自动回骂已{'关闭' if AI_ABUSE_MANUAL_OFF else '开启'}",
+            show_alert=True
+        )
+        content, markup = build_ai_settings()
+        await edit(content, markup)
+        logger.info(f"AI auto-abuse toggled: manual_off={AI_ABUSE_MANUAL_OFF}, effective={AI_ENABLED}")
+        return
+
+    # --- Check AI connection status ---
+    if data == "check_ai_status":
+        if not AI_AUTO_ENABLED:
+            await query.answer("❌ 未配置 AI API 密钥", show_alert=True)
+            return
+        # Direct API check - bypass check_ai_token's complex logic
+        _last_ai_check = None
+        try:
+            async with httpx.AsyncClient(timeout=10) as c:
+                r = await c.post(
+                    f"{AI_BASE_URL}/chat/completions",
+                    headers={"Authorization": f"Bearer {AI_API_KEY}"},
+                    json={
+                        "model": INSULT_MODEL,
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "max_tokens": 1
+                    }
+                )
+                if r.status_code == 200:
+                    _last_ai_check = (True, time.time())
+                    await query.answer("✅ AI 连接正常", show_alert=True)
+                elif r.status_code in (401, 403):
+                    _last_ai_check = (False, time.time())
+                    await query.answer("❌ AI API 密钥无效（401/403）", show_alert=True)
+                else:
+                    await query.answer(f"⚠️ 未知状态码: {r.status_code}", show_alert=True)
+        except Exception as e:
+            logger.error(f"check_ai_status direct API error: {e}")
+            await query.answer("⚠️ 无法验证（网络错误）", show_alert=True)
+        content, markup = build_ai_settings()
+        await edit(content, markup)
+        return
+
+    # --- AI API key panel ---
+    if data == "ai_apikey_panel":
+        content, markup = build_ai_apikey_panel()
+        await edit(content, markup)
+        return
+
+    # --- AI set key mode (starts text input mode) ---
+    if data == "ai_setkey_mode":
+        await query.answer("💬 请直接在聊天框输入新密钥，或发送 /cancel 取消", show_alert=True)
+        # Store context that we're waiting for API key
+        ai_setkey_waiting.add(chat_id)
+        return
+
+    # --- AI model panel ---
+    if data == "ai_model_panel":
+        content, markup = build_ai_model_panel()
         await edit(content, markup)
         return
 
@@ -1072,6 +1567,108 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit(content, markup)
         return
 
+    # --- User detail panel ---
+    if data.startswith("user_detail_"):
+        uid = int(data.split("_")[2])
+        content, markup = build_user_detail(uid)
+        await edit(content, markup)
+        return
+
+    # --- Insult confirm panel (first layer - count selection) ---
+    if data.startswith("insult_confirm_"):
+        uid = int(data.split("_")[2])
+        content, markup = build_insult_confirm(uid)
+        await edit(content, markup)
+        return
+
+    # --- Insult confirm panel (second layer - final confirm) ---
+    if data.startswith("insult_confirm2_"):
+        parts = data.split("_")
+        uid = int(parts[2])
+        count = int(parts[3])
+        content, markup = build_insult_confirm2(uid, count)
+        await edit(content, markup)
+        return
+
+    # --- Insult execute (after two confirmations) ---
+    if data.startswith("insult_send_"):
+        parts = data.split("_")
+        uid = int(parts[2])
+        count = int(parts[3]) if len(parts) >= 4 else 1
+        count = min(max(count, 1), 5)
+        if not AI_ENABLED:
+            await edit("❌ AI 未配置，无法回骂", InlineKeyboardMarkup([
+                [InlineKeyboardButton("↩ 返回", callback_data=f"user_detail_{uid}")]
+            ]))
+            return
+        insults = []
+        for i in range(count):
+            insult = await ai_generate_insult("辱骂")
+            if insult:
+                insults.append(insult)
+                await send_msg(uid, insult)
+                await asyncio.sleep(0.5)
+        stats_add("abuse_replies", count)
+        # Record AI insult count (separate from abuse_count)
+        old_ai = state.get(uid).get("ai_insult_count", 0)
+        state.update(uid, ai_insult_count=old_ai + count, has_forwarded=True)
+        logger.info(f"Owner manually insulted user {uid} x{count}")
+        u = state.get(uid)
+        name = u.get("full_name", "") or u.get("username", "") or f"ID:{uid}"
+        result_lines = [f"✅ 已回骂 **{name}** ×{count}条\n"]
+        for j, ins in enumerate(insults, 1):
+            preview = ins[:60] + "..." if len(ins) > 60 else ins
+            result_lines.append(f"{j}. {preview}")
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("↩ 返回用户详情", callback_data=f"user_detail_{uid}")]
+        ])
+        await edit("\n".join(result_lines), markup)
+        return
+
+    # --- Delete user confirm ---
+    if data.startswith("delete_confirm_"):
+        uid = int(data.split("_")[2])
+        content, markup = build_delete_confirm(uid)
+        await edit(content, markup)
+        return
+
+    # --- Delete user execute ---
+    if data.startswith("delete_do_"):
+        uid = int(data.split("_")[2])
+        if uid in state.users:
+            del state.users[uid]
+            state.save()
+            logger.info(f"Owner deleted user {uid} from records")
+        content, markup = build_user_list(0)
+        await edit(f"🗑 已删除用户 {uid}\n\n" + content, markup)
+        return
+
+    # --- Clear all confirm ---
+    if data == "clearall_confirm":
+        content, markup = build_clearall_confirm()
+        await edit(content, markup)
+        return
+
+    # --- Clear all execute ---
+    if data == "clearall_do":
+        count = len(state.users)
+        state.users.clear()
+        state.save()
+        logger.info(f"Owner cleared all {count} user records")
+        await edit(f"🗑 已清空全部 {count} 个用户记录",
+                   InlineKeyboardMarkup([[InlineKeyboardButton("↩ 返回菜单", callback_data="menu")]]))
+        return
+
+    # --- User search ---
+    if data == "users_search":
+        # Enter search mode
+        search_active[query.from_user.id] = True
+        await edit(
+            "🔍 **搜索用户**\n\n发送用户名、用户ID或 @username 来搜索。\n支持模糊匹配。发送 `/cancel_search` 取消。",
+            InlineKeyboardMarkup([[InlineKeyboardButton("↩ 返回用户列表", callback_data="users_p0")]])
+        )
+        return
+
     # --- Blocked list pagination ---
     if data.startswith("blocked_p"):
         page = int(data.split("p")[1])
@@ -1093,17 +1690,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 state.update(uid, blocked=False)
                 logger.info(f"Owner unblocked user {uid}")
             elif prefix == "reset_":
-                state.update(uid, msgs_checked=0, approved=False, spam_count=0, auto_reply_used=0)
+                state.update(uid, msgs_checked=0, approved=False, spam_count=0, abuse_count=0,
+                             auto_reply_used=0, has_forwarded=False, last_fwd_msg_id=0,
+                             ai_insult_count=0)
                 logger.info(f"Owner reset user {uid}")
 
-            # Refresh current view
-            if "blocked_p" in data or prefix == "unblock_":
-                # Came from blocked list? Rebuild blocked list (page 0)
-                content, markup = build_blocked_list(0)
-            else:
-                content, markup = build_user_list(0)
+            content, markup = build_user_detail(uid)
             await edit(content, markup)
             return
+
+    # Fallback: acknowledge any unhandled callback
+    await query.answer()
 
 
 async def cmd_cancel_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1158,6 +1755,7 @@ async def main():
                                  {"command": "status", "description": "查看所有用户状态"},
                                  {"command": "reply", "description": "回复陌生人"},
                                  {"command": "start", "description": "查看帮助"},
+                                 {"command": "cancel_search", "description": "取消用户搜索"},
                              ],
                              "scope": {"type": "chat", "chat_id": OWNER_ID}
                          })
