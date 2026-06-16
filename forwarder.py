@@ -874,10 +874,11 @@ def build_ai_apikey_panel():
         "🔑 API 密钥管理\n\n"
         f"平台：{platform}\n"
         f"当前密钥：{masked}\n\n"
-        "点击下方按钮修改密钥，或回复 /ai_setkey <新密钥>"
+        "修改密钥请先选择平台："
     )
     markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✏️ 修改密钥（输入模式）", callback_data="ai_setkey_mode")],
+        [InlineKeyboardButton("🔵 硅基流动 (SiliconFlow)", callback_data="ai_setkey_platform_siliconflow")],
+        [InlineKeyboardButton("🟠 OpenRouter", callback_data="ai_setkey_platform_openrouter")],
         [InlineKeyboardButton("↩ 返回 AI 设置", callback_data="ai_settings")],
     ])
     return text, markup
@@ -1218,6 +1219,7 @@ async def handle_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # === AI API key input mode ===
     if uid in ai_setkey_waiting:
         ai_setkey_waiting.discard(uid)
+        platform = ai_setkey_platform.pop(uid, "siliconflow")
         new_key = msg.text.strip()
         if new_key in ("/cancel", "取消"):
             await msg.reply_text("✅ 已取消密钥修改")
@@ -1226,16 +1228,17 @@ async def handle_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text("❌ 密钥无效（太短），请重试")
             return
         cfg["ai"]["api_key"] = new_key
+        cfg["ai"]["platform"] = platform
         save_config(cfg)
         AI_AUTO_ENABLED = (new_key.strip() != "")
         AI_ENABLED = AI_AUTO_ENABLED and not AI_ABUSE_MANUAL_OFF
         await msg.reply_text(
-            f"✅ AI API 密钥已更新\n\nAI 自动启用：{'✅' if AI_ENABLED else '❌'}",
+            f"✅ {platform} API 密钥已更新\n\nAI 自动启用：{'✅' if AI_ENABLED else '❌'}",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("↩ 返回 AI 设置", callback_data="ai_settings")]
             ])
         )
-        logger.info("Owner updated AI API key")
+        logger.info(f"Owner updated AI API key for {platform}")
         return
 
     # === Auto-reply text editing mode ===
@@ -1294,11 +1297,12 @@ auto_reply_editing: set[int] = set()
 search_active: set[int] = set()
 # Track which owner is waiting for API key input
 ai_setkey_waiting: set[int] = set()
+ai_setkey_platform: dict[int, str] = {}
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle all inline button callbacks from owner."""
-    global AI_ABUSE_MANUAL_OFF, AI_ENABLED, cfg, _last_ai_check, ai_setkey_waiting
+    global AI_ABUSE_MANUAL_OFF, AI_ENABLED, cfg, _last_ai_check, ai_setkey_waiting, ai_setkey_platform
     query = update.callback_query
     logger.info(f"Callback query received: data={query.data}, from={query.from_user.id}")
 
@@ -1419,11 +1423,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit(content, markup)
         return
 
-    # --- AI set key mode (starts text input mode) ---
-    if data == "ai_setkey_mode":
-        await query.answer("💬 请直接在聊天框输入新密钥，或发送 /cancel 取消", show_alert=True)
-        # Store context that we're waiting for API key
+    # --- AI set key platform selection ---
+    if data.startswith("ai_setkey_platform_"):
+        platform = data.split("_")[3]  # siliconflow or openrouter
+        await query.answer(f"💬 请在聊天框输入 {platform} 的新 API 密钥，或发送 /cancel 取消", show_alert=True)
         ai_setkey_waiting.add(chat_id)
+        ai_setkey_platform[chat_id] = platform
         return
 
     # --- AI model panel ---
