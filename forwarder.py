@@ -14,7 +14,7 @@ Features:
 - Blocked user management, auto-reply, keyword management
 """
 
-__version__ = "2.0.0"
+__version__ = "1.0.0"
 
 import asyncio, json, logging, os, signal, sys, time
 import httpx
