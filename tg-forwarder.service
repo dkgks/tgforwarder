@@ -5,12 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /home/user/tg-forwarder/forwarder.py /home/user/tg-forwarder/config.json
-WorkingDirectory=/home/user/tg-forwarder
+ExecStart=/usr/bin/python3 %h/tg-forwarder/forwarder.py %h/tg-forwarder/config.json
+WorkingDirectory=%h/tg-forwarder
 Restart=always
 RestartSec=10
-StandardOutput=append:/home/user/tg-forwarder/forwarder.log
-StandardError=append:/home/user/tg-forwarder/forwarder.log
 
 [Install]
 WantedBy=default.target
