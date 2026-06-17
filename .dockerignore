@@ -1,0 +1,10 @@
+*
+.*
+
+!forwarder.py
+!requirements.txt
+!config.example.json
+!keywords.example.json
+!.gitignore
+!weekly_report.py
+!tgfwd.sh

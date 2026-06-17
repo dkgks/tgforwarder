@@ -1,0 +1,13 @@
+services:
+  tgforwarder:
+    build: .
+    container_name: tgforwarder
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+    command: ["python3", "forwarder.py", "/app/data/config.json"]
+
+# Quick start:
+#   1. cp config.example.json data/config.json
+#   2. Edit data/config.json → fill in your bot_token and owner_id
+#   3. docker compose up -d
