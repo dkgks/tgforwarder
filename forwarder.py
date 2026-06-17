@@ -14,7 +14,7 @@ Features:
 - Blocked user management, auto-reply, keyword management
 """
 
-__version__ = "1.6.1"
+__version__ = "1.6.2"
 
 import asyncio, json, logging, os, signal, sys, time
 import httpx
@@ -266,6 +266,10 @@ def remove_keyword(kind: str, word: str):
 
 ABUSE_KW: set = set()
 SPAM_KW: set = set()
+
+# Track active panel message ID so we can delete old panel before showing new one
+ACTIVE_PANEL_MSG_ID: dict = {}
+
 
 def refresh_kw_sets():
     kw = load_keywords()
@@ -686,16 +690,29 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         await update.message.reply_text(WELCOME_MSG)
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
 
 
 async def cmd_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if msg.from_user.id != OWNER_ID:
+        await msg.reply_text("用法: /reply <用户ID> <消息>")
+        try:
+            await msg.delete()
+        except Exception:
+            pass
         return
     try:
         parts = msg.text.split(None, 2)
         if len(parts) < 3:
             await msg.reply_text("用法: /reply <用户ID> <消息>")
+            try:
+                await msg.delete()
+            except Exception:
+                pass
             return
         uid = int(parts[1])
         text = parts[2]
@@ -704,8 +721,16 @@ async def cmd_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text(f"✅ 已回复用户 {uid}")
         else:
             await msg.reply_text(f"❌ 回复失败（用户可能已拉黑机器人）")
+        try:
+            await msg.delete()
+        except Exception:
+            pass
     except ValueError:
         await msg.reply_text("用户ID必须是数字")
+        try:
+            await msg.delete()
+        except Exception:
+            pass
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -715,6 +740,10 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if not state.users:
         await msg.reply_text("暂无追踪用户。")
+        try:
+            await msg.delete()
+        except Exception:
+            pass
         return
     lines = []
     for uid, u in state.users.items():
@@ -730,6 +759,10 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         abuse = f" 🤬×{u.get('abuse_count',0)}" if u.get('abuse_count', 0) > 0 else ""
         lines.append(f"`{uid}` {name}{uname} — {status}{spam}{abuse}")
     await msg.reply_text(f"📊 追踪用户 ({len(state.users)})：\n" + "\n".join(lines[:30]), parse_mode="Markdown")
+    try:
+        await msg.delete()
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -1447,7 +1480,19 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if msg.from_user.id != OWNER_ID:
         return
-    await msg.reply_text(build_menu_msg(), reply_markup=MENU_INLINE_BOARD, parse_mode="Markdown")
+    # Delete previous panel if it exists
+    prev_id = ACTIVE_PANEL_MSG_ID.get(OWNER_ID)
+    if prev_id:
+        try:
+            await context.bot.delete_message(chat_id=OWNER_ID, message_id=prev_id)
+        except Exception:
+            pass
+    reply = await msg.reply_text(build_menu_msg(), reply_markup=MENU_INLINE_BOARD, parse_mode="Markdown")
+    ACTIVE_PANEL_MSG_ID[OWNER_ID] = reply.message_id
+    try:
+        await msg.delete()
+    except Exception:
+        pass
 
 
 async def handle_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1618,15 +1663,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- Menu navigation ---
     if data == "menu":
+        # Delete previous panel (if different from current message)
+        prev_id = ACTIVE_PANEL_MSG_ID.get(OWNER_ID)
+        if prev_id and prev_id != msg_id:
+            try:
+                await context.bot.delete_message(chat_id=OWNER_ID, message_id=prev_id)
+            except Exception:
+                pass
         await edit(build_menu_msg(), MENU_INLINE_BOARD)
+        ACTIVE_PANEL_MSG_ID[OWNER_ID] = msg_id
         return
 
     if data == "close_menu":
-        # Delete the menu message to clean up the chat
         try:
             await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
         except Exception as e:
             logger.error(f"Delete message error: {e}")
+        if ACTIVE_PANEL_MSG_ID.get(OWNER_ID) == msg_id:
+            ACTIVE_PANEL_MSG_ID.pop(OWNER_ID, None)
         return
 
     # --- Settings sub-menu ===
@@ -2262,6 +2316,10 @@ async def cmd_cancel_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if uid in kw_adding:
         del kw_adding[uid]
     await msg.reply_text("✅ 已取消编辑")
+    try:
+        await msg.delete()
+    except Exception:
+        pass
 
 
 async def handle_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2399,10 +2457,6 @@ async def main():
                          json={
                              "commands": [
                                  {"command": "menu", "description": "打开管理面板"},
-                                 {"command": "status", "description": "查看所有用户状态"},
-                                 {"command": "reply", "description": "回复陌生人"},
-                                 {"command": "start", "description": "查看帮助"},
-                                 {"command": "cancel_search", "description": "取消用户搜索"},
                              ],
                              "scope": {"type": "chat", "chat_id": OWNER_ID}
                          })
