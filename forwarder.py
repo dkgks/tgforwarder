@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 """
-import os
-
 Telegram Message Forwarder with AI Spam/Abuse Filter
 
 Multi-instance ready: each instance points to its own config file.
