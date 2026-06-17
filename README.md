@@ -16,13 +16,21 @@
 
 ## 快速开始
 
-### 🚀 一键脚本（推荐）
+### 🐳 Docker 一键部署（推荐）
 
 ```bash
 bash <(curl -sSL https://raw.githubusercontent.com/dkgks/tgforwarder/main/setup.sh)
 ```
 
-脚本会引导你输入 Bot Token 和用户 ID，自动完成克隆、配置、启动。
+脚本会引导输入 Bot Token 和用户 ID，自动完成克隆、配置、Docker 启动。
+
+### 🖥️ Linux 一键部署（非 Docker）
+
+```bash
+bash <(curl -sSL https://raw.githubusercontent.com/dkgks/tgforwarder/main/install.sh)
+```
+
+无需 Docker，直接安装 Python 依赖并启动。推荐再用 `bash tgfwd.sh` 选 1 安装为系统服务。
 
 ### Docker 手动部署
 

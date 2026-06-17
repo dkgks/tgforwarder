@@ -20,4 +20,4 @@ VOLUME ["/app/data"]
 ENV CONFIG_PATH=/app/data/config.json
 
 ENTRYPOINT ["tini", "--"]
-CMD ["python3", "forwarder.py"]
+CMD ["python3", "forwarder.py", "/app/data/config.json"]
