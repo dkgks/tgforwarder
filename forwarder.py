@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """
+import os
+
 Telegram Message Forwarder with AI Spam/Abuse Filter
 
 Multi-instance ready: each instance points to its own config file.
@@ -88,7 +90,7 @@ def stats_get_and_reset():
     save_stats(saved)
     logger.info("Stats reset - was: ads_blocked=%r, abuse_replies=%r", s.get("ads_blocked", 0), s.get("abuse_replies", 0))
     return s
-LOG_FILE = "/home/user/tg-forwarder/forwarder.log"
+LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "forwarder.log")
 
 logging.basicConfig(
     level=logging.INFO,
