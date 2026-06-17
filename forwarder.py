@@ -14,7 +14,7 @@ Features:
 - Blocked user management, auto-reply, keyword management
 """
 
-__version__ = "1.6.0"
+__version__ = "1.6.1"
 
 import asyncio, json, logging, os, signal, sys, time
 import httpx
@@ -275,11 +275,11 @@ def refresh_kw_sets():
     SPAM_KW.update(kw.get("spam", []))
 
 
-def record_blocked_content(user_id: int, text: str, kind: str):
+def record_blocked_content(user_id: int, text: str, kind: str, matched=None):
     """Record up to 3 blocked messages in user state for admin review."""
     us = state.ensure_user(user_id, "", "")
     hist = list(us.get("abuse_history", []) or [])
-    hist.append({"text": text[:200], "type": kind, "time": datetime_iso()})
+    hist.append({"text": text[:200], "type": kind, "time": datetime_iso(), "matched": matched})
     if len(hist) > 3:
         hist = hist[-3:]
     state.update(user_id, abuse_history=hist)
@@ -290,18 +290,23 @@ refresh_kw_sets()  # init on import
 
 def local_check(text: str) -> str:
     """Fast local pre-check. Returns 'ABUSE', 'SPAM', 'MAYBE', or 'OK'."""
+def local_check(text: str):
+    """Returns (label, [matched_keywords]) - label: OK/ABUSE/SPAM/MAYBE."""
     if len(text.strip()) < 2:
-        return "OK"
+        return ("OK", [])
     t = text.lower().replace(" ", "")
-    # Check abuse first (higher priority)
+    matched = []
     for kw in ABUSE_KW:
         if kw in t:
-            return "ABUSE"
-    # Check spam
+            matched.append(kw)
+    if matched:
+        return ("ABUSE", matched)
     for kw in SPAM_KW:
         if kw in t:
-            return "SPAM"
-    return "MAYBE"  # need AI to decide
+            matched.append(kw)
+    if matched:
+        return ("SPAM", matched)
+    return ("MAYBE", [])
 
 
 async def ai_classify(text: str) -> str:
@@ -537,9 +542,9 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     spam_c = us.get("spam_count", 0)
 
     # === 1. Local ABUSE check ===
-    local = local_check(text)
+    local, matched_kws = local_check(text)
     if local == "ABUSE":
-        record_blocked_content(user.id, text, "abuse")
+        record_blocked_content(user.id, text, "abuse", matched_kws)
         abuse_c = us.get("abuse_count", 0) + 1
         checked = 0  # reset continuous count
         if abuse_c >= 2:
@@ -553,7 +558,7 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 insult = "请文明用语，再有一次将被拉黑。"
         else:
-            insult = "请文明用语，这条内容不会转发给管理员。"
+            insult = "请文明用语，此条消息不会转发给管理员。"
         await send_msg(user.id, insult)
         state.update(user.id, msgs_checked=checked, spam_count=spam_c, abuse_count=abuse_c,
                      last_active=datetime_iso(), last_msg_time=datetime_iso())
@@ -562,7 +567,7 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # === 2. Local SPAM check ===
     if local == "SPAM":
-        record_blocked_content(user.id, text, "spam")
+        record_blocked_content(user.id, text, "spam", matched_kws)
         spam_c += 1
         checked = 0  # reset continuous count
         if spam_c == 1:
@@ -609,7 +614,7 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"User {user.id} msg#{checked} → {label}: {text[:100]}")
 
     if "ABUSE" in label:
-        record_blocked_content(user.id, text, "abuse")
+        record_blocked_content(user.id, text, "abuse", ["AI"])
         abuse_c = us.get("abuse_count", 0) + 1
         checked = 0
         if abuse_c >= 2:
@@ -623,7 +628,7 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 insult = "请文明用语，再有一次将被拉黑。"
         else:
-            insult = "请文明用语，这条内容不会转发给管理员。"
+            insult = "请文明用语，此条消息不会转发给管理员。"
         await send_msg(user.id, insult)
         state.update(user.id, msgs_checked=checked, spam_count=spam_c, abuse_count=abuse_c,
                      last_active=datetime_iso(), last_msg_time=datetime_iso())
@@ -631,7 +636,7 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if label == "SPAM":
-        record_blocked_content(user.id, text, "spam")
+        record_blocked_content(user.id, text, "spam", ["AI"])
         spam_c += 1
         checked = 0
         if spam_c == 1:
@@ -1368,10 +1373,15 @@ def build_abuse_history(uid: int):
         for i, entry in enumerate(reversed(hist), 1):
             kind = entry.get("type", "??")
             icon = "🚫" if kind == "abuse" else "🟡"
-            label = "脏话" if kind == "abuse" else "广告"
+            label_text = "脏话" if kind == "abuse" else "广告"
             t = to_local_time(entry.get("time", ""), UTC_OFFSET)
             content = entry.get("text", "")[:150]
-            lines.append(f"{i}. {icon} **{label}** · {t}\n>\_{content}\_\n")
+            matched = entry.get("matched", [])
+            if matched:
+                matched_str = ", ".join(matched)
+                lines.append(f"{i}. {icon} **{label_text}** · {t}\n   命中: {matched_str}\n   > {content}\n")
+            else:
+                lines.append(f"{i}. {icon} **{label_text}** · {t}\n   > {content}\n")
         text = "\n".join(lines)
 
     markup = InlineKeyboardMarkup([
@@ -2294,7 +2304,7 @@ async def rollback_watchdog():
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/getMe"
+                f"https://api.telegram.org/bot{NEW_BOT_TOKEN}/getMe"
             )
             if r.status_code == 200 and r.json().get("ok"):
                 logger.info("Upgrade watchdog: getMe OK, upgrade successful")
