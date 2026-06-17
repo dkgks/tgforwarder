@@ -1,0 +1,16 @@
+[Unit]
+Description=Telegram Message Forwarder Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /root/.openclaw/forwarder/forwarder.py /root/.openclaw/forwarder/config.json
+WorkingDirectory=/root/.openclaw/forwarder
+Restart=always
+RestartSec=10
+StandardOutput=append:/root/.openclaw/forwarder/forwarder.log
+StandardError=append:/root/.openclaw/forwarder/forwarder.log
+
+[Install]
+WantedBy=default.target
