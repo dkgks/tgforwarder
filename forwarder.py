@@ -14,7 +14,7 @@ Features:
 - Blocked user management, auto-reply, keyword management
 """
 
-__version__ = "1.6.2"
+__version__ = "2.0.0"
 
 import asyncio, json, logging, os, signal, sys, time
 import httpx
@@ -79,7 +79,11 @@ def load_stats():
 def save_stats(s):
     with open(STATS_FILE + ".tmp", "w") as f:
         json.dump(s, f)
-    os.replace(STATS_FILE + ".tmp", STATS_FILE)
+    try:
+        os.replace(STATS_FILE + ".tmp", STATS_FILE)
+    except OSError:
+        import shutil
+        shutil.move(STATS_FILE + ".tmp", STATS_FILE)
 
 def stats_add(key, n=1):
     s = load_stats()
@@ -161,6 +165,7 @@ class State:
     def __init__(self, path):
         self.path = path
         self.users: dict[int, dict] = {}
+        self._lock = asyncio.Lock()
         self.load()
 
     def load(self):
@@ -171,41 +176,59 @@ class State:
         except (FileNotFoundError, json.JSONDecodeError):
             self.users = {}
 
-    def save(self):
+    def _save_locked(self):
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         tmp = self.path + ".tmp"
         with open(tmp, "w") as f:
             json.dump({str(k): v for k, v in self.users.items()}, f, indent=2)
-        os.replace(tmp, self.path)
+        try:
+            os.replace(tmp, self.path)
+        except OSError:
+            import shutil
+            shutil.move(tmp, self.path)
 
-    def get(self, uid):
+    async def save(self):
+        async with self._lock:
+            self._save_locked()
+
+    def _get_locked(self, uid):
         return self.users.get(uid, {"msgs_checked": 0, "approved": False, "spam_count": 0,
                                     "full_name": "", "username": "", "first_seen": "",
                                     "blocked": False, "auto_reply_used": 0,
-                                                                        "abuse_count": 0, "has_forwarded": False,
+                                    "abuse_count": 0, "has_forwarded": False,
                                     "last_fwd_msg_id": 0, "last_active": "",
-                                    "ai_insult_count": 0, "last_msg_time": ""})
+                                    "ai_insult_count": 0, "last_msg_time": "",
+                                    "abuse_history": []})
 
+    def get(self, uid):
+        # Read-only snapshot: safe without lock since dict reads are atomic in CPython
+        return self.users.get(uid, self._get_locked(uid))
 
+    async def update(self, uid, **kw):
+        async with self._lock:
+            entry = self._get_locked(uid)
+            entry.update(kw)
+            self.users[uid] = entry
+            self._save_locked()
 
-    def update(self, uid, **kw):
-        entry = self.get(uid)
-        entry.update(kw)
-        self.users[uid] = entry
-        self.save()
-
-    def ensure_user(self, uid, full_name="", username=""):
+    async def ensure_user(self, uid, full_name="", username=""):
         """Ensure user exists with basic info; call on every message."""
-        entry = self.get(uid)
-        if not entry.get("first_seen"):
-            entry["first_seen"] = datetime_iso()
-        if full_name and not entry.get("full_name"):
-            entry["full_name"] = full_name
-        if username and not entry.get("username"):
-            entry["username"] = username
-        self.users[uid] = entry
-        self.save()
-        return entry
+        async with self._lock:
+            entry = self._get_locked(uid)
+            if not entry.get("first_seen"):
+                entry["first_seen"] = datetime_iso()
+            if full_name and not entry.get("full_name"):
+                entry["full_name"] = full_name
+            if username and not entry.get("username"):
+                entry["username"] = username
+            self.users[uid] = entry
+            self._save_locked()
+            return entry
+
+    @property
+    def user_copy(self):
+        # Snapshot for admin panel reads (no lock needed)
+        return self.users.copy()
 
 
 state = State(STATE_FILE)
@@ -221,10 +244,34 @@ def load_auto_reply():
 def save_auto_reply(cfg):
     with open(AUTO_REPLY_FILE + ".tmp", "w") as f:
         json.dump(cfg, f, indent=2)
-    os.replace(AUTO_REPLY_FILE + ".tmp", AUTO_REPLY_FILE)
+    try:
+        os.replace(AUTO_REPLY_FILE + ".tmp", AUTO_REPLY_FILE)
+    except OSError:
+        import shutil
+        shutil.move(AUTO_REPLY_FILE + ".tmp", AUTO_REPLY_FILE)
 
 
 reply_map: dict[int, int] = {}
+REPLY_MAP_FILE = os.path.join(DATA_DIR, "reply_map.json")
+
+def _save_reply_map():
+    try:
+        tmp = REPLY_MAP_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({str(k): v for k, v in reply_map.items()}, f)
+        os.replace(tmp, REPLY_MAP_FILE)
+    except Exception as e:
+        logger.error(f"Failed to save reply_map: {e}")
+
+def _load_reply_map():
+    try:
+        with open(REPLY_MAP_FILE) as f:
+            reply_map.update({int(k): v for k, v in json.load(f).items()})
+        logger.info(f"Loaded reply_map: {len(reply_map)} entries")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.warning(f"Failed to load reply_map: {e}")
 
 # === Keyword management (dynamic, persisted) ===
 def load_keywords():
@@ -248,7 +295,11 @@ def load_keywords():
 def save_keywords(kw):
     with open(KEYWORDS_FILE + ".tmp", "w") as f:
         json.dump(kw, f, ensure_ascii=False, indent=2)
-    os.replace(KEYWORDS_FILE + ".tmp", KEYWORDS_FILE)
+    try:
+        os.replace(KEYWORDS_FILE + ".tmp", KEYWORDS_FILE)
+    except OSError:
+        import shutil
+        shutil.move(KEYWORDS_FILE + ".tmp", KEYWORDS_FILE)
 
 def add_keyword(kind: str, word: str):
     kw = load_keywords()
@@ -270,6 +321,10 @@ SPAM_KW: set = set()
 # Track active panel message ID so we can delete old panel before showing new one
 ACTIVE_PANEL_MSG_ID: dict = {}
 
+# Pending graceful restart flag (used by update flow instead of os.kill)
+_pending_restart = False
+_stop_event: asyncio.Event | None = None
+
 
 def refresh_kw_sets():
     kw = load_keywords()
@@ -281,19 +336,17 @@ def refresh_kw_sets():
 
 def record_blocked_content(user_id: int, text: str, kind: str, matched=None):
     """Record up to 3 blocked messages in user state for admin review."""
-    us = state.ensure_user(user_id, "", "")
+    us = await state.ensure_user(user_id, "", "")
     hist = list(us.get("abuse_history", []) or [])
     hist.append({"text": text[:200], "type": kind, "time": datetime_iso(), "matched": matched})
     if len(hist) > 3:
         hist = hist[-3:]
-    state.update(user_id, abuse_history=hist)
+    await state.update(user_id, abuse_history=hist)
 
 
 refresh_kw_sets()  # init on import
 
 
-def local_check(text: str) -> str:
-    """Fast local pre-check. Returns 'ABUSE', 'SPAM', 'MAYBE', or 'OK'."""
 def local_check(text: str):
     """Returns (label, [matched_keywords]) - label: OK/ABUSE/SPAM/MAYBE."""
     if len(text.strip()) < 2:
@@ -457,6 +510,9 @@ async def send_msg(chat_id: int, text: str) -> bool:
 async def forward_to_owner(uid: int, name: str, username: str, text: str,
                               spam_count: int = 0, abuse_count: int = 0) -> int:
     """Forward legit message. Returns Telegram message_id or 0 on failure."""
+    # Escape Markdown special chars in user-supplied text to avoid 400 errors
+    md_escape = str.maketrans({c: f"\\{c}" for c in "_*[]()~`>#+-=|{}.!"})
+    safe_text = text[:3500].translate(md_escape)
     uname = f" @{username}" if username else ""
     tags = []
     if spam_count > 0:
@@ -464,7 +520,7 @@ async def forward_to_owner(uid: int, name: str, username: str, text: str,
     if abuse_count > 0:
         tags.append(f"🤬脏话×{abuse_count}")
     tag_line = " " + " ".join(tags) if tags else ""
-    msg = f"📩 **{name}**{uname}\n🆔 `{uid}`{tag_line}\n\n{text[:3500]}"
+    msg = f"📩 **{name}**{uname}\n🆔 `{uid}`{tag_line}\n\n{safe_text}"
     try:
         async with httpx.AsyncClient(timeout=15) as c:
             r = await c.post(
@@ -476,6 +532,7 @@ async def forward_to_owner(uid: int, name: str, username: str, text: str,
                 if data.get("ok"):
                     fwd_id = data["result"]["message_id"]
                     reply_map[fwd_id] = uid
+                    _save_reply_map()
                     logger.info(f"Forwarded to owner msg#{fwd_id} ← user {uid}")
                     return fwd_id
     except Exception as e:
@@ -528,15 +585,17 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply = msg.reply_to_message
         if reply and reply.message_id in reply_map:
             sid = reply_map.pop(reply.message_id)
+            _save_reply_map()
             await send_msg(sid, msg.text)
             logger.info(f"Owner replied to stranger {sid}")
             if sid in state.users:
-                state.update(sid, approved=True)
+                await state.update(sid, approved=True)
                 logger.info(f"Auto-approved user {sid} (owner replied)")
         return
 
     text = msg.text
-    us = state.ensure_user(user.id, user.full_name or "", user.username or "")
+    now = datetime_iso()
+    us = await state.ensure_user(user.id, user.full_name or "", user.username or "")
 
     if us.get("blocked"):
         await send_msg(user.id, "你已被拉黑")
@@ -550,13 +609,14 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if local == "ABUSE":
         record_blocked_content(user.id, text, "abuse", matched_kws)
         abuse_c = us.get("abuse_count", 0) + 1
-        checked = 0  # reset continuous count
+        checked = 0
+        update_kw = {"msgs_checked": checked, "spam_count": spam_c, "abuse_count": abuse_c,
+                     "last_active": now, "last_msg_time": now}
         if abuse_c >= 2:
             if AI_ENABLED:
                 insult = await ai_generate_insult(text)
                 stats_add("abuse_replies")
-                old_ai = us.get("ai_insult_count", 0)
-                state.update(user.id, ai_insult_count=old_ai + 1)
+                update_kw["ai_insult_count"] = us.get("ai_insult_count", 0) + 1
                 if us.get("has_forwarded") and us.get("last_fwd_msg_id"):
                     await tag_forwarded_message(us["last_fwd_msg_id"], "⚠️ 已启动AI自动回骂")
             else:
@@ -564,8 +624,7 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             insult = "请文明用语，此条消息不会转发给管理员。"
         await send_msg(user.id, insult)
-        state.update(user.id, msgs_checked=checked, spam_count=spam_c, abuse_count=abuse_c,
-                     last_active=datetime_iso(), last_msg_time=datetime_iso())
+        await state.update(user.id, **update_kw)
         logger.info(f"ABUSE from {user.id} (local hit, abuse #{abuse_c}) → replied")
         return
 
@@ -573,7 +632,9 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if local == "SPAM":
         record_blocked_content(user.id, text, "spam", matched_kws)
         spam_c += 1
-        checked = 0  # reset continuous count
+        checked = 0
+        update_kw = {"msgs_checked": checked, "spam_count": spam_c,
+                     "last_active": now, "last_msg_time": now}
         if spam_c == 1:
             stats_add("ads_blocked")
             await send_msg(user.id, "请勿发送广告。")
@@ -582,9 +643,9 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_msg(user.id, "请注意言辞，再发广告将被拉黑。")
         else:
             stats_add("ads_blocked")
-            state.update(user.id, blocked=True)
+            update_kw["blocked"] = True
             await send_msg(user.id, "你已被拉黑，滚吧。")
-        state.update(user.id, msgs_checked=checked, spam_count=spam_c, last_active=datetime_iso(), last_msg_time=datetime_iso())
+        await state.update(user.id, **update_kw)
         logger.info(f"SPAM from {user.id} (local hit, spam #{spam_c}) → auto-replied")
         return
 
@@ -592,12 +653,13 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if us.get("approved"):
         checked = us.get("msgs_checked", 0) + 1
         old_abuse = us.get("abuse_count", 0)
-        state.update(user.id, msgs_checked=checked, spam_count=spam_c,
-                     last_active=datetime_iso(), last_msg_time=datetime_iso())
+        update_kw = {"msgs_checked": checked, "spam_count": spam_c,
+                     "last_active": now, "last_msg_time": now}
         fwd_id = await forward_to_owner(user.id, user.full_name, user.username, text,
                                         spam_c, old_abuse)
         if fwd_id:
-            state.update(user.id, has_forwarded=True, last_fwd_msg_id=fwd_id)
+            update_kw["has_forwarded"] = True
+            update_kw["last_fwd_msg_id"] = fwd_id
         logger.info(f"Approved user {user.id} msg → forwarded")
         auto_cfg = load_auto_reply()
         if auto_cfg.get("enabled"):
@@ -605,28 +667,30 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
             used = us.get("auto_reply_used", 0)
             if used < max_cnt:
                 await send_msg(user.id, auto_cfg["text"])
-                state.update(user.id, auto_reply_used=used + 1)
+                update_kw["auto_reply_used"] = used + 1
+        await state.update(user.id, **update_kw)
         return
 
     # === 4. Not approved → AI classify ===
-    checked = us.get("msgs_checked", 0)
+    checked_us = us.get("msgs_checked", 0)
     if AI_ENABLED:
         label = await ai_classify(text)
     else:
         label = "OK"
-    checked += 1
+    checked = checked_us + 1
     logger.info(f"User {user.id} msg#{checked} → {label}: {text[:100]}")
 
     if "ABUSE" in label:
         record_blocked_content(user.id, text, "abuse", ["AI"])
         abuse_c = us.get("abuse_count", 0) + 1
         checked = 0
+        update_kw = {"msgs_checked": checked, "spam_count": spam_c, "abuse_count": abuse_c,
+                     "last_active": now, "last_msg_time": now}
         if abuse_c >= 2:
             if AI_ENABLED:
                 insult = await ai_generate_insult(text)
                 stats_add("abuse_replies")
-                old_ai = us.get("ai_insult_count", 0)
-                state.update(user.id, ai_insult_count=old_ai + 1)
+                update_kw["ai_insult_count"] = us.get("ai_insult_count", 0) + 1
                 if us.get("has_forwarded") and us.get("last_fwd_msg_id"):
                     await tag_forwarded_message(us["last_fwd_msg_id"], "⚠️ 已启动AI自动回骂")
             else:
@@ -634,8 +698,7 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             insult = "请文明用语，此条消息不会转发给管理员。"
         await send_msg(user.id, insult)
-        state.update(user.id, msgs_checked=checked, spam_count=spam_c, abuse_count=abuse_c,
-                     last_active=datetime_iso(), last_msg_time=datetime_iso())
+        await state.update(user.id, **update_kw)
         logger.info(f"ABUSE from {user.id} (AI, abuse #{abuse_c}) → replied")
         return
 
@@ -643,6 +706,8 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
         record_blocked_content(user.id, text, "spam", ["AI"])
         spam_c += 1
         checked = 0
+        update_kw = {"msgs_checked": checked, "spam_count": spam_c,
+                     "last_active": now, "last_msg_time": now}
         if spam_c == 1:
             stats_add("ads_blocked")
             await send_msg(user.id, "请勿发送广告。")
@@ -651,24 +716,26 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_msg(user.id, "请注意言辞，再发广告将被拉黑。")
         else:
             stats_add("ads_blocked")
-            state.update(user.id, blocked=True)
+            update_kw["blocked"] = True
             await send_msg(user.id, "你已被拉黑，滚吧。")
-        state.update(user.id, msgs_checked=checked, spam_count=spam_c, last_active=datetime_iso(), last_msg_time=datetime_iso())
+        await state.update(user.id, **update_kw)
         logger.info(f"SPAM from {user.id} (AI, spam #{spam_c}) → auto-replied")
         return
 
     # === 5. OK → forward ===
     old_abuse = us.get("abuse_count", 0)
-    state.update(user.id, spam_count=spam_c, last_active=datetime_iso(), last_msg_time=datetime_iso())
+    update_kw = {"spam_count": spam_c, "last_active": now, "last_msg_time": now}
     if checked >= 10:
-        state.update(user.id, approved=True, msgs_checked=checked)
+        update_kw["approved"] = True
+        update_kw["msgs_checked"] = checked
         logger.info(f"User {user.id} APPROVED (continuous {checked} OK)")
     else:
-        state.update(user.id, msgs_checked=checked)
+        update_kw["msgs_checked"] = checked
     fwd_id = await forward_to_owner(user.id, user.full_name, user.username, text,
                                     spam_c, old_abuse)
     if fwd_id:
-        state.update(user.id, has_forwarded=True, last_fwd_msg_id=fwd_id)
+        update_kw["has_forwarded"] = True
+        update_kw["last_fwd_msg_id"] = fwd_id
     logger.info(f"User {user.id} OK → forwarded")
 
     auto_cfg = load_auto_reply()
@@ -677,8 +744,8 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
         used = us.get("auto_reply_used", 0)
         if used < max_cnt:
             await send_msg(user.id, auto_cfg["text"])
-            state.update(user.id, auto_reply_used=used + 1)
-
+            update_kw["auto_reply_used"] = used + 1
+    await state.update(user.id, **update_kw)
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
@@ -1938,7 +2005,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("↩ 返回菜单（请稍后）", callback_data="menu")],
             ]))
             logger.info(f"Update to {tag} complete, restarting...")
-            os.kill(os.getpid(), signal.SIGTERM)
+            global _pending_restart, _stop_event
+            _pending_restart = True
+            if _stop_event:
+                _stop_event.set()
 
         except Exception as e:
             logger.error(f"update_do error: {e}")
@@ -1973,7 +2043,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("❌ 未配置 AI API 密钥", show_alert=True)
             return
         # Direct API check - bypass check_ai_token's complex logic
-        _last_ai_check = None
         try:
             async with httpx.AsyncClient(timeout=10) as c:
                 r = await c.post(
@@ -2214,7 +2283,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await asyncio.sleep(0.5)
         stats_add("abuse_replies", count)
         old_ai = state.get(uid).get("ai_insult_count", 0)
-        state.update(uid, ai_insult_count=old_ai + count, has_forwarded=True)
+        await state.update(uid, ai_insult_count=old_ai + count, has_forwarded=True)
         logger.info(f"Owner manually insulted user {uid} x{count}")
         u = state.get(uid)
         name = u.get("full_name", "") or u.get("username", "") or f"ID:{uid}"
@@ -2240,7 +2309,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = int(data.split("_")[2])
         if uid in state.users:
             del state.users[uid]
-            state.save()
+            await state.save()
             logger.info(f"Owner deleted user {uid} from records")
         content, markup = build_user_list(0)
         await edit(f"🗑 已删除用户 {uid}\n\n" + content, markup)
@@ -2256,7 +2325,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "clearall_do":
         count = len(state.users)
         state.users.clear()
-        state.save()
+        await state.save()
         logger.info(f"Owner cleared all {count} user records")
         await edit(f"🗑 已清空全部 {count} 个用户记录",
                    InlineKeyboardMarkup([[InlineKeyboardButton("↩ 返回菜单", callback_data="menu")]]))
@@ -2284,16 +2353,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data.startswith(prefix):
             uid = int(data[len(prefix):])
             if prefix == "approve_":
-                state.update(uid, approved=True)
+                await state.update(uid, approved=True)
                 logger.info(f"Owner approved user {uid}")
             elif prefix == "block_":
-                state.update(uid, blocked=True)
+                await state.update(uid, blocked=True)
                 logger.info(f"Owner blocked user {uid}")
             elif prefix == "unblock_":
-                state.update(uid, blocked=False)
+                await state.update(uid, blocked=False)
                 logger.info(f"Owner unblocked user {uid}")
             elif prefix == "reset_":
-                state.update(uid, msgs_checked=0, approved=False, spam_count=0, abuse_count=0,
+                await state.update(uid, msgs_checked=0, approved=False, spam_count=0, abuse_count=0,
                              auto_reply_used=0, has_forwarded=False, last_fwd_msg_id=0,
                              ai_insult_count=0, abuse_history=[])
                 logger.info(f"Owner reset user {uid}")
@@ -2415,7 +2484,10 @@ async def rollback_watchdog():
         os.remove(flag_path)
         # Keep backup dir for debugging
         logger.info(f"Upgrade watchdog: rollback to v{from_ver} complete, restarting...")
-        os.kill(os.getpid(), signal.SIGTERM)
+        global _pending_restart, _stop_event
+        _pending_restart = True
+        if _stop_event:
+            _stop_event.set()
 
     except Exception as e:
         logger.error(f"Upgrade watchdog: rollback failed: {e}")
@@ -2428,6 +2500,7 @@ async def rollback_watchdog():
 
 
 async def main():
+    global SERVER_LOCATION, UTC_OFFSET, _stop_event
     logger.info("Starting Forwarder...")
 
     # Auto-detect server location on first run (cached in config.json)
@@ -2444,8 +2517,10 @@ async def main():
     # Check for pending upgrade verification / rollback
     flag_path = os.path.join(INSTANCE_DIR, "upgrade_flag.json")
     if os.path.exists(flag_path):
-        asyncio.create_task(rollback_watchdog())
+        task = asyncio.create_task(rollback_watchdog())
+        task.add_done_callback(lambda t: logger.error(f"Rollback watchdog crashed: {t.exception()}") if t.exception() else None)
 
+    _load_reply_map()
     app = Application.builder().token(NEW_BOT_TOKEN).build()
 
     # === Register owner-only commands (appears in menu button next to input) ===
@@ -2484,13 +2559,18 @@ async def main():
 
         logger.info("Forwarder running!")
         stop = asyncio.Event()
+        _stop_event = stop
         for sig in (signal.SIGINT, signal.SIGTERM):
             asyncio.get_running_loop().add_signal_handler(sig, stop.set)
         await stop.wait()
+        _stop_event = None
 
         await app.updater.stop()
         await app.stop()
         await app.shutdown()
+
+        if _pending_restart:
+            logger.info("Pending restart detected, exiting cleanly.")
 
     logger.info("Forwarder stopped.")
 
