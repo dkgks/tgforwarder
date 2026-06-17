@@ -1777,6 +1777,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit(content, markup)
         return
 
+    if data == "tz_refresh":
+        global SERVER_LOCATION
+        loc = await detect_server_location()
+        if loc:
+            SERVER_LOCATION = loc
+            cfg_server = load_config()
+            cfg_server["server_location"] = loc
+            save_config(cfg_server)
+            await query.answer(
+                f"已刷新：{loc['country']} {loc['city']} UTC{loc['utc_offset']:+d}",
+                show_alert=True
+            )
+        else:
+            await query.answer("检测失败，请检查网络后重试", show_alert=True)
+        content, markup = build_timezone_settings()
+        await edit(content, markup)
+        return
+
     if data.startswith("tz_"):
         global UTC_OFFSET
         tz_val = data[3:]
@@ -1796,24 +1814,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except ValueError:
                 await query.answer("无效的时区值", show_alert=True)
                 return
-        content, markup = build_timezone_settings()
-        await edit(content, markup)
-        return
-
-    if data == "tz_refresh":
-        global SERVER_LOCATION
-        loc = await detect_server_location()
-        if loc:
-            SERVER_LOCATION = loc
-            cfg_server = load_config()
-            cfg_server["server_location"] = loc
-            save_config(cfg_server)
-            await query.answer(
-                f"已刷新：{loc['country']} {loc['city']} UTC{loc['utc_offset']:+d}",
-                show_alert=True
-            )
-        else:
-            await query.answer("检测失败，请检查网络后重试", show_alert=True)
         content, markup = build_timezone_settings()
         await edit(content, markup)
         return
