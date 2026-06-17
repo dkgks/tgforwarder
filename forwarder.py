@@ -252,7 +252,7 @@ def save_auto_reply(cfg):
 
 
 reply_map: dict[int, int] = {}
-REPLY_MAP_FILE = os.path.join(INSTANCE_DIR, "reply_map.json")
+REPLY_MAP_FILE = os.path.join(DATA_DIR, "reply_map.json")
 
 def _save_reply_map():
     try:
@@ -334,7 +334,7 @@ def refresh_kw_sets():
     SPAM_KW.update(kw.get("spam", []))
 
 
-async def record_blocked_content(user_id: int, text: str, kind: str, matched=None):
+def record_blocked_content(user_id: int, text: str, kind: str, matched=None):
     """Record up to 3 blocked messages in user state for admin review."""
     us = await state.ensure_user(user_id, "", "")
     hist = list(us.get("abuse_history", []) or [])
@@ -607,7 +607,7 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # === 1. Local ABUSE check ===
     local, matched_kws = local_check(text)
     if local == "ABUSE":
-        await record_blocked_content(user.id, text, "abuse", matched_kws)
+        record_blocked_content(user.id, text, "abuse", matched_kws)
         abuse_c = us.get("abuse_count", 0) + 1
         checked = 0
         update_kw = {"msgs_checked": checked, "spam_count": spam_c, "abuse_count": abuse_c,
@@ -630,7 +630,7 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # === 2. Local SPAM check ===
     if local == "SPAM":
-        await record_blocked_content(user.id, text, "spam", matched_kws)
+        record_blocked_content(user.id, text, "spam", matched_kws)
         spam_c += 1
         checked = 0
         update_kw = {"msgs_checked": checked, "spam_count": spam_c,
@@ -681,7 +681,7 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"User {user.id} msg#{checked} → {label}: {text[:100]}")
 
     if "ABUSE" in label:
-        await record_blocked_content(user.id, text, "abuse", ["AI"])
+        record_blocked_content(user.id, text, "abuse", ["AI"])
         abuse_c = us.get("abuse_count", 0) + 1
         checked = 0
         update_kw = {"msgs_checked": checked, "spam_count": spam_c, "abuse_count": abuse_c,
@@ -703,7 +703,7 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if label == "SPAM":
-        await record_blocked_content(user.id, text, "spam", ["AI"])
+        record_blocked_content(user.id, text, "spam", ["AI"])
         spam_c += 1
         checked = 0
         update_kw = {"msgs_checked": checked, "spam_count": spam_c,
@@ -1547,19 +1547,21 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if msg.from_user.id != OWNER_ID:
         return
-    # Delete previous panel if it exists
     prev_id = ACTIVE_PANEL_MSG_ID.get(OWNER_ID)
+    # Step 1: Send new panel first (so chat doesn't flash empty)
+    reply = await msg.reply_text(build_menu_msg(), reply_markup=MENU_INLINE_BOARD, parse_mode="Markdown")
+    ACTIVE_PANEL_MSG_ID[OWNER_ID] = reply.message_id
+    # Step 2: Delete the /menu command message
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+    # Step 3: Delete previous panel after new one is visible
     if prev_id:
         try:
             await context.bot.delete_message(chat_id=OWNER_ID, message_id=prev_id)
         except Exception:
             pass
-    reply = await msg.reply_text(build_menu_msg(), reply_markup=MENU_INLINE_BOARD, parse_mode="Markdown")
-    ACTIVE_PANEL_MSG_ID[OWNER_ID] = reply.message_id
-    try:
-        await msg.delete()
-    except Exception:
-        pass
 
 
 async def handle_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2570,17 +2572,10 @@ async def main():
         await app.shutdown()
 
         if _pending_restart:
-            logger.info("Pending restart detected, exiting with non-zero for systemd restart.")
-            sys.exit(42)
+            logger.info("Pending restart detected, exiting cleanly.")
 
     logger.info("Forwarder stopped.")
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except SystemExit:
-        raise
-    except Exception:
-        logger.exception("Fatal error in main")
-        sys.exit(1)
+    asyncio.run(main())
