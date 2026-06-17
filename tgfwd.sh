@@ -222,6 +222,10 @@ EOF
     echo -e "${GREEN}✅ 机器人已配置: $INSTANCE_NAME${NC}"
     echo "  配置文件: $CONFIG_FILE"
 
+    # 启用 systemd 服务（开机自启），但不立即启动
+    systemctl enable "tg-forwarder@$INSTANCE_NAME" 2>/dev/null
+    echo "  已设置开机自启"
+
     return 0
 }
 
@@ -231,27 +235,21 @@ start_bot() {
     local name="$(basename $(dirname $conf))"
     echo -e "${BLUE}[*] 启动机器人: $name${NC}"
 
-    # 检查是否已在运行
-    if pgrep -f "forwarder.py $conf" >/dev/null; then
-        echo -e "${YELLOW}  ⚠️  已在运行，跳过${NC}"
-        return 0
-    fi
-
-    nohup python3 "$INSTALL_DIR/forwarder.py" "$conf" > "$INSTALL_DIR/logs/${name}.out" 2>&1 &
+    systemctl start "tg-forwarder@$name" 2>/dev/null
     sleep 1
-    if pgrep -f "forwarder.py $conf" >/dev/null; then
+    if systemctl is-active --quiet "tg-forwarder@$name"; then
         echo -e "${GREEN}  ✅ 启动成功${NC}"
     else
-        echo -e "${RED}  ❌ 启动失败，查看日志: $INSTALL_DIR/logs/${name}.out${NC}"
+        echo -e "${RED}  ❌ 启动失败，查看: systemctl status tg-forwarder@$name${NC}"
     fi
 }
 
 # ============================================================
 stop_bot() {
     local conf="$1"
-    local pids=$(pgrep -f "forwarder.py $conf")
-    if [ -n "$pids" ]; then
-        kill $pids 2>/dev/null
+    local name="$(basename $(dirname $conf))"
+    if systemctl is-active --quiet "tg-forwarder@$name"; then
+        systemctl stop "tg-forwarder@$name"
         echo -e "${GREEN}✅ 已停止${NC}"
     else
         echo -e "${YELLOW}⚠️  未在运行${NC}"
@@ -293,7 +291,7 @@ main_menu() {
                         if [ -f "${d}config.json" ]; then
                             name=$(basename "$d")
                             conf="${d}config.json"
-                            if pgrep -f "forwarder.py $conf" >/dev/null; then
+                            if systemctl is-active --quiet "tg-forwarder@$name"; then
                                 status="${GREEN}运行中${NC}"
                             else
                                 status="${RED}已停止${NC}"
@@ -402,8 +400,8 @@ main_menu() {
                 fi
                 # 重启所有运行中的机器人
                 echo -e "${BLUE}[*] 重启运行中的机器人...${NC}"
-                for conf in "$INSTALL_DIR/instances"/bot_*/config.json; do
-                    [ -f "$conf" ] && stop_bot "$conf" && start_bot "$conf"
+                for svc in $(systemctl list-units --all --no-legend "tg-forwarder@*" 2>/dev/null | awk '{print $1}'); do
+                    systemctl restart "$svc" && echo "    ✅ $svc"
                 done
                 cd - >/dev/null
                 ;;
