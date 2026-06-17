@@ -252,7 +252,7 @@ def save_auto_reply(cfg):
 
 
 reply_map: dict[int, int] = {}
-REPLY_MAP_FILE = os.path.join(DATA_DIR, "reply_map.json")
+REPLY_MAP_FILE = os.path.join(INSTANCE_DIR, "reply_map.json")
 
 def _save_reply_map():
     try:
@@ -334,7 +334,7 @@ def refresh_kw_sets():
     SPAM_KW.update(kw.get("spam", []))
 
 
-def record_blocked_content(user_id: int, text: str, kind: str, matched=None):
+async def record_blocked_content(user_id: int, text: str, kind: str, matched=None):
     """Record up to 3 blocked messages in user state for admin review."""
     us = await state.ensure_user(user_id, "", "")
     hist = list(us.get("abuse_history", []) or [])
@@ -607,7 +607,7 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # === 1. Local ABUSE check ===
     local, matched_kws = local_check(text)
     if local == "ABUSE":
-        record_blocked_content(user.id, text, "abuse", matched_kws)
+        await record_blocked_content(user.id, text, "abuse", matched_kws)
         abuse_c = us.get("abuse_count", 0) + 1
         checked = 0
         update_kw = {"msgs_checked": checked, "spam_count": spam_c, "abuse_count": abuse_c,
@@ -630,7 +630,7 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # === 2. Local SPAM check ===
     if local == "SPAM":
-        record_blocked_content(user.id, text, "spam", matched_kws)
+        await record_blocked_content(user.id, text, "spam", matched_kws)
         spam_c += 1
         checked = 0
         update_kw = {"msgs_checked": checked, "spam_count": spam_c,
@@ -681,7 +681,7 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"User {user.id} msg#{checked} → {label}: {text[:100]}")
 
     if "ABUSE" in label:
-        record_blocked_content(user.id, text, "abuse", ["AI"])
+        await record_blocked_content(user.id, text, "abuse", ["AI"])
         abuse_c = us.get("abuse_count", 0) + 1
         checked = 0
         update_kw = {"msgs_checked": checked, "spam_count": spam_c, "abuse_count": abuse_c,
@@ -703,7 +703,7 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if label == "SPAM":
-        record_blocked_content(user.id, text, "spam", ["AI"])
+        await record_blocked_content(user.id, text, "spam", ["AI"])
         spam_c += 1
         checked = 0
         update_kw = {"msgs_checked": checked, "spam_count": spam_c,
