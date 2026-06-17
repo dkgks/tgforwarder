@@ -2504,6 +2504,24 @@ async def rollback_watchdog():
 
 async def main():
     global SERVER_LOCATION, UTC_OFFSET, _stop_event
+
+    # --- PID-based mutual exclusion ---
+    pidfile = os.path.join(INSTANCE_DIR, "forwarder.pid")
+    try:
+        with open(pidfile) as f:
+            old_pid = int(f.read().strip())
+        try:
+            os.kill(old_pid, 0)  # signal 0 = check existence, no actual signal
+            logger.error(f"Another instance is already running (PID {old_pid}). Exiting.")
+            print(f"❌ 已有实例在运行 (PID {old_pid})，退出。")
+            sys.exit(1)
+        except (OSError, ProcessLookupError):
+            # Stale pidfile — old process is gone, overwrite it
+            logger.info(f"Stale pidfile found (PID {old_pid} no longer exists), overwriting.")
+    except (FileNotFoundError, ValueError):
+        pass
+    with open(pidfile, "w") as f:
+        f.write(str(os.getpid()))
     logger.info("Starting Forwarder...")
 
     # Auto-detect server location on first run (cached in config.json)
@@ -2579,4 +2597,11 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    finally:
+        pidfile = os.path.join(INSTANCE_DIR, "forwarder.pid")
+        try:
+            os.remove(pidfile)
+        except OSError:
+            pass
