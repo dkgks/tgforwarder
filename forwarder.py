@@ -2505,8 +2505,10 @@ async def rollback_watchdog():
 async def main():
     global SERVER_LOCATION, UTC_OFFSET, _stop_event
 
-    # --- PID-based mutual exclusion ---
-    pidfile = os.path.join(INSTANCE_DIR, "forwarder.pid")
+    # --- PID-based mutual exclusion (per-config, supports multi-bot on one host) ---
+    import hashlib
+    config_tag = hashlib.md5(CONFIG_PATH.encode()).hexdigest()[:8]
+    pidfile = os.path.join(INSTANCE_DIR, f"forwarder.{config_tag}.pid")
     try:
         fd = os.open(pidfile, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
         with os.fdopen(fd, "w") as f:
