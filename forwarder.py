@@ -584,8 +584,7 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user.id == OWNER_ID:
         reply = msg.reply_to_message
         if reply and reply.message_id in reply_map:
-            sid = reply_map.pop(reply.message_id)
-            _save_reply_map()
+            sid = reply_map[reply.message_id]
             await send_msg(sid, msg.text)
             logger.info(f"Owner replied to stranger {sid}")
             if sid in state.users:
