@@ -42,19 +42,48 @@ docker compose up -d
 docker compose logs -f
 ```
 
-### Linux 手动部署
+### Linux 手动部署（非 Docker）
 
 ```bash
-# 1. 安装依赖
+# 1. 克隆仓库
+git clone https://github.com/dkgks/tgforwarder.git
+cd tgforwarder
+
+# 2. 安装 Python 依赖
 pip install python-telegram-bot[job-queue] httpx
 
-# 2. 创建配置
+# 3. 创建配置
 cp config.example.json config.json
 # 编辑 config.json，填入 bot_token 和 owner_id
+# 可选：填入 ai.api_key 启用 AI 智能分类
 
-# 3. 运行
+# 4. 测试运行
 python3 forwarder.py
+# 确认日志显示 "Forwarder running!" 后 Ctrl+C 停止
+
+# 5. 安装为系统服务（可选，推荐用于长期运行）
+bash tgfwd.sh
+# 选 1 启动 → 自动创建 systemd 服务，开机自启 + 崩溃自动重启
 ```
+
+**非 Docker 管理命令：**
+
+| 操作 | 命令 |
+|---|---|
+| 管理面板 | `bash tgfwd.sh` |
+| 启动 | `bash tgfwd.sh` → 选 1 |
+| 停止 | `bash tgfwd.sh` → 选 2 |
+| 重启 | `bash tgfwd.sh` → 选 3 |
+| 查看日志 | `bash tgfwd.sh` → 选 5 |
+| 一键升级 | `bash tgfwd.sh` → 选 8 |
+| 直接启动 | `python3 forwarder.py` |
+| 直接停止 | `systemctl --user stop tg-forwarder` |
+
+**依赖要求：**
+
+- Python 3.9+
+- 操作系统：Linux（推荐 Debian/Ubuntu）
+- systemd（用于服务管理，可选）
 
 ### 创建 Bot Token
 
