@@ -14,7 +14,7 @@ Features:
 - Blocked user management, auto-reply, keyword management
 """
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 import asyncio, json, logging, os, signal, sys, time
 import httpx
@@ -274,6 +274,17 @@ def refresh_kw_sets():
     SPAM_KW.clear()
     SPAM_KW.update(kw.get("spam", []))
 
+
+def record_blocked_content(user_id: int, text: str, kind: str):
+    """Record up to 3 blocked messages in user state for admin review."""
+    us = state.ensure_user(user_id, "", "")
+    hist = list(us.get("abuse_history", []) or [])
+    hist.append({"text": text[:200], "type": kind, "time": datetime_iso()})
+    if len(hist) > 3:
+        hist = hist[-3:]
+    state.update(user_id, abuse_history=hist)
+
+
 refresh_kw_sets()  # init on import
 
 
@@ -528,15 +539,19 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # === 1. Local ABUSE check ===
     local = local_check(text)
     if local == "ABUSE":
+        record_blocked_content(user.id, text, "abuse")
         abuse_c = us.get("abuse_count", 0) + 1
         checked = 0  # reset continuous count
-        if AI_ENABLED and abuse_c >= 2:
-            insult = await ai_generate_insult(text)
-            stats_add("abuse_replies")
-            old_ai = us.get("ai_insult_count", 0)
-            state.update(user.id, ai_insult_count=old_ai + 1)
-            if us.get("has_forwarded") and us.get("last_fwd_msg_id"):
-                await tag_forwarded_message(us["last_fwd_msg_id"], "⚠️ 已启动AI自动回骂")
+        if abuse_c >= 2:
+            if AI_ENABLED:
+                insult = await ai_generate_insult(text)
+                stats_add("abuse_replies")
+                old_ai = us.get("ai_insult_count", 0)
+                state.update(user.id, ai_insult_count=old_ai + 1)
+                if us.get("has_forwarded") and us.get("last_fwd_msg_id"):
+                    await tag_forwarded_message(us["last_fwd_msg_id"], "⚠️ 已启动AI自动回骂")
+            else:
+                insult = "请文明用语，再有一次将被拉黑。"
         else:
             insult = "请文明用语，这条内容不会转发给管理员。"
         await send_msg(user.id, insult)
@@ -547,6 +562,7 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # === 2. Local SPAM check ===
     if local == "SPAM":
+        record_blocked_content(user.id, text, "spam")
         spam_c += 1
         checked = 0  # reset continuous count
         if spam_c == 1:
@@ -557,7 +573,8 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_msg(user.id, "请注意言辞，再发广告将被拉黑。")
         else:
             stats_add("ads_blocked")
-            await send_msg(user.id, "傻逼广告")
+            state.update(user.id, blocked=True)
+            await send_msg(user.id, "你已被拉黑，滚吧。")
         state.update(user.id, msgs_checked=checked, spam_count=spam_c, last_active=datetime_iso(), last_msg_time=datetime_iso())
         logger.info(f"SPAM from {user.id} (local hit, spam #{spam_c}) → auto-replied")
         return
@@ -592,15 +609,19 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"User {user.id} msg#{checked} → {label}: {text[:100]}")
 
     if "ABUSE" in label:
+        record_blocked_content(user.id, text, "abuse")
         abuse_c = us.get("abuse_count", 0) + 1
         checked = 0
-        if AI_ENABLED and abuse_c >= 2:
-            insult = await ai_generate_insult(text)
-            stats_add("abuse_replies")
-            old_ai = us.get("ai_insult_count", 0)
-            state.update(user.id, ai_insult_count=old_ai + 1)
-            if us.get("has_forwarded") and us.get("last_fwd_msg_id"):
-                await tag_forwarded_message(us["last_fwd_msg_id"], "⚠️ 已启动AI自动回骂")
+        if abuse_c >= 2:
+            if AI_ENABLED:
+                insult = await ai_generate_insult(text)
+                stats_add("abuse_replies")
+                old_ai = us.get("ai_insult_count", 0)
+                state.update(user.id, ai_insult_count=old_ai + 1)
+                if us.get("has_forwarded") and us.get("last_fwd_msg_id"):
+                    await tag_forwarded_message(us["last_fwd_msg_id"], "⚠️ 已启动AI自动回骂")
+            else:
+                insult = "请文明用语，再有一次将被拉黑。"
         else:
             insult = "请文明用语，这条内容不会转发给管理员。"
         await send_msg(user.id, insult)
@@ -610,6 +631,7 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if label == "SPAM":
+        record_blocked_content(user.id, text, "spam")
         spam_c += 1
         checked = 0
         if spam_c == 1:
@@ -620,7 +642,8 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_msg(user.id, "请注意言辞，再发广告将被拉黑。")
         else:
             stats_add("ads_blocked")
-            await send_msg(user.id, "傻逼广告")
+            state.update(user.id, blocked=True)
+            await send_msg(user.id, "你已被拉黑，滚吧。")
         state.update(user.id, msgs_checked=checked, spam_count=spam_c, last_active=datetime_iso(), last_msg_time=datetime_iso())
         logger.info(f"SPAM from {user.id} (AI, spam #{spam_c}) → auto-replied")
         return
@@ -1304,6 +1327,7 @@ def build_user_detail(uid: int):
     ])
     rows.append([
         InlineKeyboardButton("🗑 删除用户", callback_data=f"delete_confirm_{uid}"),
+        InlineKeyboardButton("📝 屏蔽记录", callback_data=f"abuse_history_{uid}"),
     ])
     rows.append([InlineKeyboardButton("↩ 返回用户列表", callback_data="users_p0")])
 
@@ -1327,6 +1351,31 @@ def build_delete_confirm(uid: int):
             InlineKeyboardButton("✅ 确认删除", callback_data=f"delete_do_{uid}"),
             InlineKeyboardButton("❌ 取消", callback_data=f"user_detail_{uid}"),
         ]
+    ])
+    return text, markup
+
+
+def build_abuse_history(uid: int):
+    """Build abuse history panel for admin review."""
+    u = state.get(uid)
+    name = u.get("full_name", "") or u.get("username", "") or f"{uid}"
+    hist = u.get("abuse_history", []) or []
+
+    if not hist:
+        text = f"📝 **{name}** ({uid}) 屏蔽记录\n\n暂无屏蔽记录"
+    else:
+        lines = [f"📝 **{name}** ({uid}) 屏蔽记录\n"]
+        for i, entry in enumerate(reversed(hist), 1):
+            kind = entry.get("type", "??")
+            icon = "🚫" if kind == "abuse" else "🟡"
+            label = "脏话" if kind == "abuse" else "广告"
+            t = to_local_time(entry.get("time", ""), UTC_OFFSET)
+            content = entry.get("text", "")[:150]
+            lines.append(f"{i}. {icon} **{label}** · {t}\n>\_{content}\_\n")
+        text = "\n".join(lines)
+
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("↩ 返回用户详情", callback_data=f"user_detail_{uid}")],
     ])
     return text, markup
 
@@ -2049,6 +2098,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit(content, markup)
         return
 
+    # --- Abuse history ---
+    if data.startswith("abuse_history_"):
+        uid = int(data.split("_")[2])
+        content, markup = build_abuse_history(uid)
+        await edit(content, markup)
+        return
+
     # --- Insult confirm panel (first layer - count selection) ---
     if data.startswith("insult_confirm_"):
         uid = int(data.split("_")[2])
@@ -2175,7 +2231,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif prefix == "reset_":
                 state.update(uid, msgs_checked=0, approved=False, spam_count=0, abuse_count=0,
                              auto_reply_used=0, has_forwarded=False, last_fwd_msg_id=0,
-                             ai_insult_count=0)
+                             ai_insult_count=0, abuse_history=[])
                 logger.info(f"Owner reset user {uid}")
 
             content, markup = build_user_detail(uid)
