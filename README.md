@@ -16,7 +16,15 @@
 
 ## 快速开始
 
-### Docker（推荐）
+### 🚀 一键脚本（推荐）
+
+```bash
+bash <(curl -sSL https://raw.githubusercontent.com/dkgks/tgforwarder/main/setup.sh)
+```
+
+脚本会引导你输入 Bot Token 和用户 ID，自动完成克隆、配置、启动。
+
+### Docker 手动部署
 
 ```bash
 # 1. 克隆仓库

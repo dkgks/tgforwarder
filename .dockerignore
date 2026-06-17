@@ -8,3 +8,5 @@
 !.gitignore
 !weekly_report.py
 !tgfwd.sh
+!setup.sh
+!README.md
