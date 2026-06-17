@@ -22,3 +22,13 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# 更新回退
+upgrade_flag.json
+backup/
+
+# 临时和本地开发文件
+*.backup
+*.gitbak
+_apply_patches.py
+forwarder_patched.py

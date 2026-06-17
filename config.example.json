@@ -10,5 +10,7 @@
     "insult_model": "deepseek-ai/DeepSeek-V4-Flash",
     "abuse_manual_off": false
   },
-  "welcome_msg": "👋 你好，这是消息转发助手。\n\n你的留言将会被转发给管理员，他会通过这个机器人回复你。\n⚠️ 请勿发送广告或骚扰信息。\n\n有什么想说的，直接发过来吧~"
+  "welcome_msg": "👋 你好，这是消息转发助手。\n\n你的留言将会被转发给管理员，他会通过这个机器人回复你。\n⚠️ 请勿发送广告或骚扰信息。\n\n有什么想说的，直接发过来吧~",
+  "utc_offset": null,
+  "server_location": null
 }

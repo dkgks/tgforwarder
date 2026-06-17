@@ -357,15 +357,55 @@ main_menu() {
                 fi
                 ;;
             8)
-                echo -e "${BLUE}[*] 更新项目...${NC}"
+                echo -e "${BLUE}[*] 检查最新正式发布版本...${NC}"
                 cd "$INSTALL_DIR"
-                git pull --ff-only origin main && echo -e "${GREEN}✅ 更新完成${NC}" || echo -e "${RED}❌ 更新失败${NC}"
-                cd - >/dev/null
+                # Fetch latest release tag from GitHub API
+                LATEST=$(curl -sL https://api.github.com/repos/dkgks/tgforwarder/releases/latest 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('tag_name',''))" 2>/dev/null)
+                if [ -z "$LATEST" ]; then
+                    echo -e "${RED}❌ 无法获取最新版本信息，请检查网络后重试${NC}"
+                    cd - >/dev/null
+                    continue
+                else
+                    CURRENT=$(git describe --tags --abbrev=0 2>/dev/null || echo "(未知)")
+                    echo "  当前版本: $CURRENT"
+                    echo "  最新版本: $LATEST"
+                    if [ "$CURRENT" = "$LATEST" ]; then
+                        echo -e "${GREEN}  ✅ 已是最新版本，无需更新${NC}"
+                    else
+                        echo -e "${BLUE}[*] 从 GitHub Releases 下载 $LATEST ...${NC}"
+                        TMPDIR=$(mktemp -d)
+                        # Download zipball, extract, and move code files only
+                        curl -sL "https://github.com/dkgks/tgforwarder/archive/refs/tags/$LATEST.tar.gz" -o "$TMPDIR/release.tar.gz"
+                        tar xzf "$TMPDIR/release.tar.gz" -C "$TMPDIR"
+                        # Find the extracted directory (prefix varies)
+                        SRC=$(find "$TMPDIR" -maxdepth 1 -type d -name "tgforwarder-*" | head -1)
+                        if [ -d "$SRC" ]; then
+                            # Only copy code files (.py .sh .example.json), never data files
+                            echo "  正在更新代码文件..."
+                            for f in forwarder.py weekly_report.py tgfwd.sh keywords.example.json config.example.json; do
+                                if [ -f "$SRC/$f" ]; then
+                                    cp "$SRC/$f" "$INSTALL_DIR/$f"
+                                    echo "    ✅ $f"
+                                fi
+                            done
+                            # Update .gitignore too
+                            [ -f "$SRC/.gitignore" ] && cp "$SRC/.gitignore" "$INSTALL_DIR/.gitignore" && echo "    ✅ .gitignore"
+                            # Sync git tag to local repo for version tracking
+                            git fetch origin --tags 2>/dev/null || true
+                            echo -e "${GREEN}✅ 更新到 $LATEST 完成${NC}"
+                            echo -e "${YELLOW}  💡 你的 config.json、keywords.json、state.json 等数据文件未被修改${NC}"
+                        else
+                            echo -e "${RED}❌ 解包失败，更新终止${NC}"
+                        fi
+                        rm -rf "$TMPDIR"
+                    fi
+                fi
                 # 重启所有运行中的机器人
                 echo -e "${BLUE}[*] 重启运行中的机器人...${NC}"
                 for conf in "$INSTALL_DIR/instances"/bot_*/config.json; do
                     [ -f "$conf" ] && stop_bot "$conf" && start_bot "$conf"
                 done
+                cd - >/dev/null
                 ;;
             0)
                 echo "再见！"

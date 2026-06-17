@@ -14,6 +14,8 @@ Features:
 - Blocked user management, auto-reply, keyword management
 """
 
+__version__ = "1.5.0"
+
 import asyncio, json, logging, os, signal, sys, time
 import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
@@ -53,6 +55,10 @@ AI_BASE_URL = cfg.get("ai", {}).get("base_url", "https://api.siliconflow.cn/v1")
 AI_PLATFORM = cfg.get("ai", {}).get("platform", "openrouter")  # siliconflow or openrouter
 CLASSIFY_MODEL = cfg.get("ai", {}).get("classify_model", "qwen/qwen3-next-80b-a3b-instruct:free")
 INSULT_MODEL = cfg.get("ai", {}).get("insult_model", "google/gemma-4-31b-it:free")
+
+# === Timezone: null = auto (server local), int = UTC offset ===
+UTC_OFFSET = cfg.get("utc_offset")  # None (auto) or int like 8, -5
+SERVER_LOCATION = cfg.get("server_location")  # None or dict with country, city, utc_offset, cached_at
 
 # Per-instance data files (derived from config path)
 INSTANCE_DIR = os.path.dirname(os.path.abspath(CONFIG_PATH))
@@ -98,10 +104,57 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 def datetime_iso():
     return datetime.now(timezone.utc).isoformat()
+
+
+def to_local_time(dt_str: str, offset: int | None, use_server_local: bool = False) -> str:
+    """Convert UTC ISO datetime string to a human-readable local time.
+
+    If dt_str is empty/falsy, returns "无记录".
+    If offset is None AND use_server_local is False, returns server local time.
+    If offset is an integer, applies that offset (hours).
+    """
+    if not dt_str:
+        return "无记录"
+    try:
+        dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        if offset is not None:
+            dt = dt + timedelta(hours=offset)
+        else:
+            dt = dt.astimezone(None)  # server local
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return dt_str[:16].replace("T", " ")
+
+
+async def detect_server_location(timeout: int = 5) -> dict | None:
+    """Detect server location via ip-api.com (free, no key).
+
+    Returns dict with country, city, utc_offset (hours) on success, None on failure.
+    Cached in config.json under server_location.
+    """
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get("http://ip-api.com/json/", params={"fields": "country,city,timezone,offset"},
+                                 timeout=timeout)
+            if r.status_code == 200:
+                data = r.json()
+                # ip-api with fields param returns data directly (no status field)
+                if data.get("country"):
+                    return {
+                        "country": data.get("country", "未知"),
+                        "city": data.get("city", "未知"),
+                        "utc_offset": data.get("offset", 0) // 3600,
+                        "cached_at": datetime.now(timezone.utc).isoformat()[:10],
+                    }
+    except Exception as e:
+        logger.warning(f"Failed to detect server location: {e}")
+    return None
 
 
 class State:
@@ -131,7 +184,7 @@ class State:
                                     "blocked": False, "auto_reply_used": 0,
                                                                         "abuse_count": 0, "has_forwarded": False,
                                     "last_fwd_msg_id": 0, "last_active": "",
-                                    "ai_insult_count": 0})
+                                    "ai_insult_count": 0, "last_msg_time": ""})
 
 
 
@@ -179,6 +232,17 @@ def load_keywords():
         with open(KEYWORDS_FILE) as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
+        # Auto-copy from example on first run
+        example_file = os.path.join(INSTANCE_DIR, "keywords.example.json")
+        if os.path.exists(example_file):
+            import shutil
+            shutil.copy(example_file, KEYWORDS_FILE)
+            logger.info("First run: copied keywords.example.json → keywords.json")
+            try:
+                with open(KEYWORDS_FILE) as f:
+                    return json.load(f)
+            except Exception:
+                pass
         return {"abuse": [], "spam": []}
 
 def save_keywords(kw):
@@ -477,7 +541,7 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
             insult = "请文明用语，这条内容不会转发给管理员。"
         await send_msg(user.id, insult)
         state.update(user.id, msgs_checked=checked, spam_count=spam_c, abuse_count=abuse_c,
-                     last_active=datetime_iso())
+                     last_active=datetime_iso(), last_msg_time=datetime_iso())
         logger.info(f"ABUSE from {user.id} (local hit, abuse #{abuse_c}) → replied")
         return
 
@@ -494,7 +558,7 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             stats_add("ads_blocked")
             await send_msg(user.id, "傻逼广告")
-        state.update(user.id, msgs_checked=checked, spam_count=spam_c, last_active=datetime_iso())
+        state.update(user.id, msgs_checked=checked, spam_count=spam_c, last_active=datetime_iso(), last_msg_time=datetime_iso())
         logger.info(f"SPAM from {user.id} (local hit, spam #{spam_c}) → auto-replied")
         return
 
@@ -503,7 +567,7 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
         checked = us.get("msgs_checked", 0) + 1
         old_abuse = us.get("abuse_count", 0)
         state.update(user.id, msgs_checked=checked, spam_count=spam_c,
-                     last_active=datetime_iso())
+                     last_active=datetime_iso(), last_msg_time=datetime_iso())
         fwd_id = await forward_to_owner(user.id, user.full_name, user.username, text,
                                         spam_c, old_abuse)
         if fwd_id:
@@ -541,7 +605,7 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
             insult = "请文明用语，这条内容不会转发给管理员。"
         await send_msg(user.id, insult)
         state.update(user.id, msgs_checked=checked, spam_count=spam_c, abuse_count=abuse_c,
-                     last_active=datetime_iso())
+                     last_active=datetime_iso(), last_msg_time=datetime_iso())
         logger.info(f"ABUSE from {user.id} (AI, abuse #{abuse_c}) → replied")
         return
 
@@ -557,13 +621,13 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             stats_add("ads_blocked")
             await send_msg(user.id, "傻逼广告")
-        state.update(user.id, msgs_checked=checked, spam_count=spam_c, last_active=datetime_iso())
+        state.update(user.id, msgs_checked=checked, spam_count=spam_c, last_active=datetime_iso(), last_msg_time=datetime_iso())
         logger.info(f"SPAM from {user.id} (AI, spam #{spam_c}) → auto-replied")
         return
 
     # === 5. OK → forward ===
     old_abuse = us.get("abuse_count", 0)
-    state.update(user.id, spam_count=spam_c, last_active=datetime_iso())
+    state.update(user.id, spam_count=spam_c, last_active=datetime_iso(), last_msg_time=datetime_iso())
     if checked >= 10:
         state.update(user.id, approved=True, msgs_checked=checked)
         logger.info(f"User {user.id} APPROVED (continuous {checked} OK)")
@@ -689,7 +753,8 @@ def build_user_list(page=0):
         if u.get("ai_insult_count", 0) > 0:
             tags.append(f"⚡AI回骂×{u.get('ai_insult_count', 0)}")
         tag_part = " | " + " ".join(tags) if tags else ""
-        text_lines.append(f"{idx}. {name}{uname}\n   🆔 `{uid}` | {st}{tag_part}\n")
+        t = to_local_time(u.get("last_msg_time", ""), UTC_OFFSET)
+        text_lines.append(f"{idx}. {name}{uname}\n   🆔 `{uid}` | {st}{tag_part}\n   🕐 {t}\n")
         idx += 1
 
     btn_rows = []
@@ -833,9 +898,160 @@ def build_settings_menu():
         [InlineKeyboardButton("💬 欢迎词设置", callback_data="welcome_panel")],
         [InlineKeyboardButton("🤖 自动回复设置", callback_data="autoreply")],
         [InlineKeyboardButton("🤖 AI 设置", callback_data="ai_settings")],
+        [InlineKeyboardButton("🕐 时区设置", callback_data="timezone")],
+        [InlineKeyboardButton("🔄 检查更新", callback_data="check_update")],
         [InlineKeyboardButton("🗑 一键清空所有用户", callback_data="clearall_confirm")],
         [InlineKeyboardButton("↩ 返回菜单", callback_data="menu")],
     ])
+    return text, markup
+
+
+
+def build_update_panel(latest_info: dict | None = None, checking: bool = False, error: str = ""):
+    """Build update check / upgrade panel.
+
+    latest_info: None = not checked yet, dict with tag_name, body, html_url on success
+    checking: True = API call in progress
+    error: non-empty on failure
+    """
+    if checking:
+        text = (
+            "🔄 **检查更新**\n\n"
+            f"当前版本：v{__version__}\n"
+            "正在检查最新版本..."
+        )
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("↩ 返回设置", callback_data="settings")],
+        ])
+        return text, markup
+
+    if error:
+        text = (
+            "🔄 **检查更新**\n\n"
+            f"当前版本：v{__version__}\n"
+            f"❌ 检查失败：{error}"
+        )
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 重试", callback_data="check_update")],
+            [InlineKeyboardButton("↩ 返回设置", callback_data="settings")],
+        ])
+        return text, markup
+
+    if latest_info is None:
+        text = (
+            "🔄 **检查更新**\n\n"
+            f"当前版本：v{__version__}"
+        )
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔍 检查最新版本", callback_data="check_update")],
+            [InlineKeyboardButton("↩ 返回设置", callback_data="settings")],
+        ])
+        return text, markup
+
+    tag = latest_info.get("tag_name", "")
+    latest_ver = tag.lstrip("v")
+    body = (latest_info.get("body") or "（无更新说明）")[:800]
+    is_newer = latest_ver != __version__
+
+    if is_newer:
+        text = (
+            "🔄 **检查更新**\n\n"
+            f"当前版本：v{__version__}\n"
+            f"🆕 最新版本：{tag}\n\n"
+            f"📋 **更新内容：**\n{body}\n\n"
+            "⚠️ 更新仅覆盖代码文件，不影响配置和数据"
+        )
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬆️ 升级到最新版", callback_data="update_confirm")],
+            [InlineKeyboardButton("↩ 返回设置", callback_data="settings")],
+        ])
+    else:
+        text = (
+            "🔄 **检查更新**\n\n"
+            f"当前版本：v{__version__}\n"
+            f"✅ 已是最新版本（{tag}）"
+        )
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("↩ 返回设置", callback_data="settings")],
+        ])
+    return text, markup
+
+
+def build_update_confirm_panel(latest_info: dict | None):
+    """Secondary confirmation before actual upgrade."""
+    tag = latest_info.get("tag_name", "未知") if latest_info else "未知"
+    text = (
+        "⚠️ **确认升级**\n\n"
+        f"将从 v{__version__} 升级到 {tag}。\n\n"
+        "升级仅替换代码文件（.py, .sh, .example.json），\n"
+        "不会影响你的配置、词库、用户数据。\n"
+        "升级完成后机器人会自动重启。\n\n"
+        "确认升级？"
+    )
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ 确认升级", callback_data="update_do")],
+        [InlineKeyboardButton("❌ 取消", callback_data="settings")],
+    ])
+    return text, markup
+
+
+def build_timezone_settings():
+    """Timezone settings panel."""
+    # Current setting
+    if UTC_OFFSET is not None:
+        current = f"UTC{UTC_OFFSET:+d}"
+    else:
+        current = "自动（服务器本地时间）"
+
+    # Server location info
+    loc_lines = ""
+    if SERVER_LOCATION:
+        loc = SERVER_LOCATION
+        sl_offset = loc.get("utc_offset", "?")
+        sl_offset_str = f"UTC{sl_offset:+d}" if isinstance(sl_offset, int) else f"UTC{sl_offset}"
+        loc_lines = (
+            f"服务器位于：{loc['country']} {loc['city']}\n"
+            f"预计 {sl_offset_str}"
+        )
+    else:
+        loc_lines = "服务器位置：未检测"
+
+    text = (
+        "🕐 **时区设置**\n\n"
+        f"当前：{current}\n"
+        f"{loc_lines}\n\n"
+        "设置正确的时区偏移后，用户列表中的\n"
+        "时间才会显示为你所在地区的时刻。\n"
+        "如果服务器和你在同一时区，无需设置。\n\n"
+        "请选择你的时区偏移："
+    )
+
+    # Build buttons: 4 per row for -12 to +14, plus auto
+    offsets = list(range(-12, 15))  # -12..+14 inclusive
+    rows = []
+    for i in range(0, len(offsets), 4):
+        chunk = offsets[i:i + 4]
+        row = []
+        for v in chunk:
+            label = f"UTC{v:+d}"
+            callback = f"tz_{v}"
+            if v == UTC_OFFSET:
+                label = f"{label} ✅"
+            row.append(InlineKeyboardButton(label, callback_data=callback))
+        rows.append(row)
+
+    # Auto button
+    auto_label = "🔄 自动（服务器时间）"
+    if UTC_OFFSET is None:
+        auto_label = f"{auto_label} ✅"
+    rows.append([InlineKeyboardButton(auto_label, callback_data="tz_auto")])
+
+    # Refresh location
+    rows.append([InlineKeyboardButton("🔄 刷新服务器位置", callback_data="tz_refresh")])
+
+    rows.append([InlineKeyboardButton("↩ 返回设置", callback_data="settings")])
+
+    markup = InlineKeyboardMarkup(rows)
     return text, markup
 
 
@@ -1048,7 +1264,8 @@ def build_user_detail(uid: int):
     abuse_c = u.get("abuse_count", 0)
     checked = u.get("msgs_checked", 0)
     first = u.get("first_seen", "未知")[:10]
-    last = u.get("last_active", "未知")[:10]
+    last = to_local_time(u.get("last_active", ""), UTC_OFFSET)
+    last_msg_str = to_local_time(u.get("last_msg_time", ""), UTC_OFFSET)
     has_fwd = u.get("has_forwarded", False)
     ai_insult_c = u.get("ai_insult_count", 0)
 
@@ -1070,6 +1287,7 @@ def build_user_detail(uid: int):
         f"⚡ AI回骂次数：{ai_insult_c} 次",
         f"📅 首次出现：{first}",
         f"🕐 最后活跃：{last}",
+        f"💬 最后消息：{last_msg_str}",
         f"\n操作：",
     ]
 
@@ -1368,6 +1586,254 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "settings":
         content, markup = build_settings_menu()
         await edit(content, markup)
+        return
+
+    # --- Timezone settings ---
+    if data == "timezone":
+        content, markup = build_timezone_settings()
+        await edit(content, markup)
+        return
+
+    if data.startswith("tz_"):
+        global UTC_OFFSET
+        tz_val = data[3:]
+        if tz_val == "auto":
+            # Set to auto (server local time)
+            UTC_OFFSET = None
+            cfg["utc_offset"] = None
+            save_config(cfg)
+            await query.answer("已切换为自动（服务器本地时间）", show_alert=True)
+        else:
+            try:
+                v = int(tz_val)
+                UTC_OFFSET = v
+                cfg["utc_offset"] = v
+                save_config(cfg)
+                await query.answer(f"已设置时区为 UTC{v:+d}", show_alert=True)
+            except ValueError:
+                await query.answer("无效的时区值", show_alert=True)
+                return
+        content, markup = build_timezone_settings()
+        await edit(content, markup)
+        return
+
+    if data == "tz_refresh":
+        global SERVER_LOCATION
+        loc = await detect_server_location()
+        if loc:
+            SERVER_LOCATION = loc
+            cfg_server = load_config()
+            cfg_server["server_location"] = loc
+            save_config(cfg_server)
+            await query.answer(
+                f"已刷新：{loc['country']} {loc['city']} UTC{loc['utc_offset']:+d}",
+                show_alert=True
+            )
+        else:
+            await query.answer("检测失败，请检查网络后重试", show_alert=True)
+        content, markup = build_timezone_settings()
+        await edit(content, markup)
+        return
+
+    # --- Update check ---
+    if data == "check_update":
+        # Show checking state first
+        content, markup = build_update_panel(checking=True)
+        await edit(content, markup)
+        # Fetch latest release from GitHub API
+        latest = None
+        err = ""
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.get(
+                    "https://api.github.com/repos/dkgks/tgforwarder/releases/latest",
+                    headers={"Accept": "application/vnd.github+json", "User-Agent": "tgforwarder-bot"}
+                )
+                if r.status_code == 200:
+                    d = r.json()
+                    latest = {
+                        "tag_name": d.get("tag_name", ""),
+                        "body": d.get("body", ""),
+                        "html_url": d.get("html_url", ""),
+                    }
+                elif r.status_code == 404:
+                    err = "暂无发布版本"
+                elif r.status_code >= 500:
+                    err = "GitHub 暂时不可达，请稍后重试"
+                else:
+                    err = f"检查失败 (HTTP {r.status_code})"
+        except Exception as e:
+            logger.error(f"check_update error: {e}")
+            err = "网络请求失败，请稍后重试"
+        content, markup = build_update_panel(latest_info=latest, error=err)
+        await edit(content, markup)
+        return
+
+    if data == "update_confirm":
+        # Re-fetch latest release info for confirmation
+        latest = None
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.get(
+                    "https://api.github.com/repos/dkgks/tgforwarder/releases/latest",
+                    headers={"Accept": "application/vnd.github+json", "User-Agent": "tgforwarder-bot"}
+                )
+                if r.status_code == 200:
+                    d = r.json()
+                    latest = {
+                        "tag_name": d.get("tag_name", ""),
+                        "body": d.get("body", ""),
+                        "html_url": d.get("html_url", ""),
+                    }
+        except Exception as e:
+            logger.error(f"update_confirm fetch error: {e}")
+        if latest is None:
+            await query.answer("无法获取版本信息，请重试", show_alert=True)
+            return
+        content, markup = build_update_confirm_panel(latest)
+        await edit(content, markup)
+        return
+
+    if data == "update_do":
+        # Step 1: Fetch latest tag
+        tag = ""
+        step_text = "🔄 正在获取最新版本信息..."
+        await edit(step_text, InlineKeyboardMarkup([]))
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.get(
+                    "https://api.github.com/repos/dkgks/tgforwarder/releases/latest",
+                    headers={"Accept": "application/vnd.github+json", "User-Agent": "tgforwarder-bot"}
+                )
+                if r.status_code == 200:
+                    d = r.json()
+                    tag = d.get("tag_name", "")
+        except Exception as e:
+            logger.error(f"update_do fetch tag error: {e}")
+        if not tag:
+            text = "❌ GitHub 暂时不可达或暂无发布版本"
+            await edit(text, InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 重试", callback_data="check_update")],
+                [InlineKeyboardButton("↩ 返回设置", callback_data="settings")],
+            ]))
+            return
+
+        try:
+            import subprocess, shutil, tempfile
+
+            # Step 2: Backup current version
+            step2 = (
+                "🔄 **正在升级...**\n\n"
+                f"📦 ① 正在备份当前版本 (v{__version__})..."
+            )
+            await edit(step2, InlineKeyboardMarkup([]))
+
+            dest = INSTANCE_DIR
+            back_dir = os.path.join(INSTANCE_DIR, "backup", f"v{__version__}")
+            os.makedirs(back_dir, exist_ok=True)
+            backup_files = ["forwarder.py", "weekly_report.py", "tgfwd.sh",
+                           "keywords.example.json", "config.example.json", ".gitignore"]
+            backed = []
+            for fn in backup_files:
+                fp = os.path.join(dest, fn)
+                if os.path.exists(fp):
+                    shutil.copy(fp, os.path.join(back_dir, fn))
+                    backed.append(fn)
+            logger.info(f"Backed up {len(backed)} files to {back_dir}")
+
+            # Step 3: Download
+            step3 = (
+                "🔄 **正在升级...**\n\n"
+                f"📦 ① 已备份 v{__version__} ({len(backed)} 文件)\n"
+                f"⬇️ ② 正在下载 {tag}..."
+            )
+            await edit(step3, InlineKeyboardMarkup([]))
+
+            url = f"https://github.com/dkgks/tgforwarder/archive/refs/tags/{tag}.tar.gz"
+            tmpdir = tempfile.mkdtemp()
+            tarball = os.path.join(tmpdir, "release.tar.gz")
+            async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+                r2 = await client.get(url)
+                if r2.status_code != 200:
+                    raise Exception(f"下载失败：HTTP {r2.status_code}")
+                with open(tarball, "wb") as f:
+                    f.write(r2.content)
+
+            # Step 4: Extract
+            step4 = (
+                "🔄 **正在升级...**\n\n"
+                f"📦 ① 已备份 v{__version__} ({len(backed)} 文件)\n"
+                f"⬇️ ② 已下载 {tag}\n"
+                f"📦 ③ 正在解压..."
+            )
+            await edit(step4, InlineKeyboardMarkup([]))
+
+            subprocess.run(["tar", "xzf", tarball, "-C", tmpdir], check=True)
+
+            # Find source dir
+            src = None
+            for item in os.listdir(tmpdir):
+                full = os.path.join(tmpdir, item)
+                if os.path.isdir(full) and item.startswith("tgforwarder-"):
+                    src = full
+                    break
+            if not src:
+                raise Exception("解包失败：找不到源码目录")
+
+            # Step 5: Install
+            step5 = (
+                "🔄 **正在升级...**\n\n"
+                f"📦 ① 已备份 v{__version__} ({len(backed)} 文件)\n"
+                f"⬇️ ② 已下载 {tag}\n"
+                f"📦 ③ 已解压\n"
+                f"📋 ④ 正在安装代码文件..."
+            )
+            await edit(step5, InlineKeyboardMarkup([]))
+
+            copied = []
+            for fn in ["forwarder.py", "weekly_report.py", "tgfwd.sh",
+                       "keywords.example.json", "config.example.json", ".gitignore"]:
+                s = os.path.join(src, fn)
+                d = os.path.join(dest, fn)
+                if os.path.exists(s):
+                    shutil.copy(s, d)
+                    copied.append(fn)
+
+            shutil.rmtree(tmpdir)
+
+            # Write upgrade flag for rollback watchdog
+            flag_path = os.path.join(INSTANCE_DIR, "upgrade_flag.json")
+            with open(flag_path, "w") as ff:
+                json.dump({
+                    "from_version": __version__,
+                    "to_version": tag.lstrip("v"),
+                    "backup_dir": f"backup/v{__version__}",
+                    "created_at": datetime_iso(),
+                }, ff)
+
+            # Step 6: Final
+            step6 = (
+                "✅ **升级完成！**\n\n"
+                f"v{__version__} → {tag}\n"
+                f"已更新：{', '.join(copied)}\n"
+                f"备份：{back_dir}\n\n"
+                "机器人正在重启，升级验证中...\n"
+                "如有问题将自动回退到旧版本。"
+            )
+            await edit(step6, InlineKeyboardMarkup([
+                [InlineKeyboardButton("↩ 返回菜单（请稍后）", callback_data="menu")],
+            ]))
+            logger.info(f"Update to {tag} complete, restarting...")
+            os.kill(os.getpid(), signal.SIGTERM)
+
+        except Exception as e:
+            logger.error(f"update_do error: {e}")
+            text = f"❌ 升级失败：{e}"
+            await edit(text, InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 重试", callback_data="check_update")],
+                [InlineKeyboardButton("↩ 返回设置", callback_data="settings")],
+            ]))
         return
 
     # --- Toggle AI auto-abuse ---
@@ -1755,8 +2221,106 @@ async def handle_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Owner updated auto-reply text: {new_text[:50]}...")
 
 
+async def rollback_watchdog():
+    """After an upgrade, wait for bot to stabilize, then verify getMe.
+
+    If getMe fails → restore backed-up code files → kill self.
+    If getMe succeeds → cleanup upgrade_flag.json and backup dir.
+    """
+    import shutil as _shutil
+    flag_path = os.path.join(INSTANCE_DIR, "upgrade_flag.json")
+
+    # Wait for bot to connect to Telegram
+    logger.info("Upgrade watchdog: waiting 15s for bot to stabilize...")
+    await asyncio.sleep(15)
+
+    # Verify bot is alive
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/getMe"
+            )
+            if r.status_code == 200 and r.json().get("ok"):
+                logger.info("Upgrade watchdog: getMe OK, upgrade successful")
+                # Cleanup
+                if os.path.exists(flag_path):
+                    with open(flag_path) as f:
+                        flag_data = json.load(f)
+                    os.remove(flag_path)
+                    # Remove old backup
+                    back_dir = os.path.join(INSTANCE_DIR, flag_data.get("backup_dir", ""))
+                    if back_dir and os.path.isdir(back_dir):
+                        _shutil.rmtree(back_dir)
+                        logger.info(f"Upgrade watchdog: cleaned up {back_dir}")
+                return
+            else:
+                raise Exception(f"getMe failed: HTTP {r.status_code}")
+    except Exception as e:
+        logger.error(f"Upgrade watchdog: getMe verification failed: {e}")
+
+    # Rollback
+    logger.info("Upgrade watchdog: starting rollback...")
+    if not os.path.exists(flag_path):
+        logger.error("Upgrade watchdog: upgrade_flag.json not found, cannot rollback")
+        return
+
+    try:
+        with open(flag_path) as f:
+            flag_data = json.load(f)
+        back_dir = os.path.join(INSTANCE_DIR, flag_data.get("backup_dir", ""))
+        from_ver = flag_data.get("from_version", "unknown")
+
+        if not back_dir or not os.path.isdir(back_dir):
+            logger.error(f"Upgrade watchdog: backup dir not found: {back_dir}")
+            os.remove(flag_path)
+            return
+
+        # Restore backup files
+        dest = INSTANCE_DIR
+        restored = []
+        for fn in os.listdir(back_dir):
+            src = os.path.join(back_dir, fn)
+            dst = os.path.join(dest, fn)
+            if os.path.isfile(src):
+                _shutil.copy(src, dst)
+                restored.append(fn)
+
+        logger.info(f"Upgrade watchdog: restored {len(restored)} files from {back_dir}")
+
+        # Remove flag to prevent infinite rollback loop
+        os.remove(flag_path)
+        # Keep backup dir for debugging
+        logger.info(f"Upgrade watchdog: rollback to v{from_ver} complete, restarting...")
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    except Exception as e:
+        logger.error(f"Upgrade watchdog: rollback failed: {e}")
+        # Remove flag anyway to prevent loop
+        if os.path.exists(flag_path):
+            try:
+                os.remove(flag_path)
+            except Exception:
+                pass
+
+
 async def main():
     logger.info("Starting Forwarder...")
+
+    # Auto-detect server location on first run (cached in config.json)
+    global SERVER_LOCATION, UTC_OFFSET
+    if SERVER_LOCATION is None:
+        loc = await detect_server_location()
+        if loc:
+            cfg_server = load_config()
+            cfg_server["server_location"] = loc
+            save_config(cfg_server)
+            SERVER_LOCATION = loc
+            logger.info(f"Server location detected: {loc['country']} {loc['city']} UTC{loc['utc_offset']:+d}")
+
+    # Check for pending upgrade verification / rollback
+    flag_path = os.path.join(INSTANCE_DIR, "upgrade_flag.json")
+    if os.path.exists(flag_path):
+        asyncio.create_task(rollback_watchdog())
 
     app = Application.builder().token(NEW_BOT_TOKEN).build()
 
