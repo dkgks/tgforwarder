@@ -2570,10 +2570,17 @@ async def main():
         await app.shutdown()
 
         if _pending_restart:
-            logger.info("Pending restart detected, exiting cleanly.")
+            logger.info("Pending restart detected, exiting with non-zero for systemd restart.")
+            sys.exit(42)
 
     logger.info("Forwarder stopped.")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except SystemExit:
+        raise
+    except Exception:
+        logger.exception("Fatal error in main")
+        sys.exit(1)
