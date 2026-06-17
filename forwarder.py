@@ -2508,20 +2508,22 @@ async def main():
     # --- PID-based mutual exclusion ---
     pidfile = os.path.join(INSTANCE_DIR, "forwarder.pid")
     try:
-        with open(pidfile) as f:
-            old_pid = int(f.read().strip())
+        fd = os.open(pidfile, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        with os.fdopen(fd, "w") as f:
+            f.write(str(os.getpid()))
+    except FileExistsError:
         try:
-            os.kill(old_pid, 0)  # signal 0 = check existence, no actual signal
+            with open(pidfile) as f:
+                old_pid = int(f.read().strip())
+            os.kill(old_pid, 0)
             logger.error(f"Another instance is already running (PID {old_pid}). Exiting.")
-            print(f"❌ 已有实例在运行 (PID {old_pid})，退出。")
             sys.exit(1)
-        except (OSError, ProcessLookupError):
-            # Stale pidfile — old process is gone, overwrite it
-            logger.info(f"Stale pidfile found (PID {old_pid} no longer exists), overwriting.")
-    except (FileNotFoundError, ValueError):
-        pass
-    with open(pidfile, "w") as f:
-        f.write(str(os.getpid()))
+        except (OSError, ProcessLookupError, ValueError):
+            # Stale — remove and retry atomically
+            os.remove(pidfile)
+            fd = os.open(pidfile, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            with os.fdopen(fd, "w") as f:
+                f.write(str(os.getpid()))
     logger.info("Starting Forwarder...")
 
     # Auto-detect server location on first run (cached in config.json)
