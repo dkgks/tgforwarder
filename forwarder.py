@@ -1732,15 +1732,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- Menu navigation ---
     if data == "menu":
-        # Delete previous panel (if different from current message)
         prev_id = ACTIVE_PANEL_MSG_ID.get(OWNER_ID)
+        # Step 1: Update current message to menu panel first
+        await edit(build_menu_msg(), MENU_INLINE_BOARD)
+        ACTIVE_PANEL_MSG_ID[OWNER_ID] = msg_id
+        # Step 2: Delete old panel after new one is displayed
         if prev_id and prev_id != msg_id:
             try:
                 await context.bot.delete_message(chat_id=OWNER_ID, message_id=prev_id)
             except Exception:
                 pass
-        await edit(build_menu_msg(), MENU_INLINE_BOARD)
-        ACTIVE_PANEL_MSG_ID[OWNER_ID] = msg_id
         return
 
     if data == "close_menu":
