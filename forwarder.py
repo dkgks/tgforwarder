@@ -14,7 +14,7 @@ Features:
 - Blocked user management, auto-reply, keyword management
 """
 
-__version__ = "1.7.2"
+__version__ = "1.7.3"
 
 import asyncio, json, logging, os, signal, sys, time
 import httpx
@@ -1259,11 +1259,11 @@ def build_ai_model_panel():
         "🧠 **自定义模型**\n\n"
         f"分类模型：{classify_model}\n"
         f"回骂模型：{insult_model}\n\n"
-        "修改模型请用命令行：\n"
-        "`/ai_classify_model <模型名>`\n"
-        "`/ai_insult_model <模型名>`"
+        "点击下方按钮修改模型："
     )
     markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔍 修改分类模型", callback_data="ai_set_classify_model")],
+        [InlineKeyboardButton("🤬 修改回骂模型", callback_data="ai_set_insult_model")],
         [InlineKeyboardButton("↩ 返回 AI 设置", callback_data="ai_settings")],
     ])
     return text, markup
@@ -1630,6 +1630,33 @@ async def handle_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(btns), parse_mode="Markdown")
         return
 
+    # === AI model name input mode ===
+    if uid in ai_model_waiting:
+        mode = ai_model_waiting.pop(uid)
+        global CLASSIFY_MODEL, INSULT_MODEL
+        model_name = msg.text.strip()
+        if model_name in ("/cancel", "取消"):
+            await msg.reply_text("✅ 已取消模型修改")
+            return
+        if not model_name or len(model_name) < 3:
+            await msg.reply_text("❌ 模型名无效（太短），请重试")
+            return
+        cfg["ai"][mode] = model_name
+        save_config(cfg)
+        if mode == "classify_model":
+            CLASSIFY_MODEL = model_name
+        elif mode == "insult_model":
+            INSULT_MODEL = model_name
+        label = "分类" if mode == "classify_model" else "回骂"
+        await msg.reply_text(
+            f"✅ {label}模型已更新：`{model_name}`", parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("↩ 返回 AI 设置", callback_data="ai_settings")]
+            ])
+        )
+        logger.info(f"Owner updated {mode} to {model_name}")
+        return
+
     # === AI API key input mode ===
     if uid in ai_setkey_waiting:
         ai_setkey_waiting.discard(uid)
@@ -1641,9 +1668,11 @@ async def handle_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not new_key or len(new_key) < 3:
             await msg.reply_text("❌ 密钥无效（太短），请重试")
             return
+        global AI_API_KEY
         cfg["ai"]["api_key"] = new_key
         cfg["ai"]["platform"] = platform
         save_config(cfg)
+        AI_API_KEY = new_key
         AI_AUTO_ENABLED = (new_key.strip() != "")
         AI_ENABLED = AI_AUTO_ENABLED and not AI_ABUSE_MANUAL_OFF
         await msg.reply_text(
@@ -1712,6 +1741,8 @@ search_active: set[int] = set()
 # Track which owner is waiting for API key input
 ai_setkey_waiting: set[int] = set()
 ai_setkey_platform: dict[int, str] = {}
+# Track which owner is waiting for AI model name input
+ai_model_waiting: dict[int, str] = {}  # uid -> "classify_model" | "insult_model"
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1931,7 +1962,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             await edit(step2, InlineKeyboardMarkup([]))
 
-            dest = INSTANCE_DIR
+            dest = os.path.dirname(os.path.abspath(__file__))
             back_dir = os.path.join(INSTANCE_DIR, "backup", f"v{__version__}")
             os.makedirs(back_dir, exist_ok=True)
             backup_files = ["forwarder.py", "weekly_report.py", "tgfwd.sh",
@@ -2109,6 +2140,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "ai_model_panel":
         content, markup = build_ai_model_panel()
         await edit(content, markup)
+        return
+
+    # --- AI model change (sets waiting state for text input) ---
+    if data == "ai_set_classify_model":
+        await query.answer("💬 请在聊天框输入新的分类模型名，或发送 /cancel 取消", show_alert=True)
+        ai_model_waiting[chat_id] = "classify_model"
+        return
+
+    if data == "ai_set_insult_model":
+        await query.answer("💬 请在聊天框输入新的回骂模型名，或发送 /cancel 取消", show_alert=True)
+        ai_model_waiting[chat_id] = "insult_model"
         return
 
     # --- Welcome message ===
@@ -2457,21 +2499,46 @@ async def rollback_watchdog():
             )
             if r.status_code == 200 and r.json().get("ok"):
                 logger.info("Upgrade watchdog: getMe OK, upgrade successful")
+                to_ver = "unknown"
                 # Cleanup
                 if os.path.exists(flag_path):
                     with open(flag_path) as f:
                         flag_data = json.load(f)
+                    to_ver = flag_data.get("to_version", "unknown")
                     os.remove(flag_path)
                     # Remove old backup
                     back_dir = os.path.join(INSTANCE_DIR, flag_data.get("backup_dir", ""))
                     if back_dir and os.path.isdir(back_dir):
                         _shutil.rmtree(back_dir)
                         logger.info(f"Upgrade watchdog: cleaned up {back_dir}")
+                # Notify owner
+                msg = (
+                    f"✅ **升级成功！**\n\n"
+                    f"当前版本：v{to_ver}\n"
+                    f"机器人已正常重启运转。"
+                )
+                try:
+                    async with httpx.AsyncClient(timeout=10) as nc:
+                        await nc.post(
+                            f"https://api.telegram.org/bot{NEW_BOT_TOKEN}/sendMessage",
+                            json={"chat_id": OWNER_ID, "text": msg}
+                        )
+                except Exception:
+                    pass
                 return
             else:
                 raise Exception(f"getMe failed: HTTP {r.status_code}")
     except Exception as e:
         logger.error(f"Upgrade watchdog: getMe verification failed: {e}")
+        # Notify owner of failure (rollback will follow)
+        try:
+            async with httpx.AsyncClient(timeout=10) as nc:
+                await nc.post(
+                    f"https://api.telegram.org/bot{NEW_BOT_TOKEN}/sendMessage",
+                    json={"chat_id": OWNER_ID, "text": "⚠️ **升级验证失败，正在自动回退...**"}
+                )
+        except Exception:
+            pass
 
     # Rollback
     logger.info("Upgrade watchdog: starting rollback...")
@@ -2506,6 +2573,15 @@ async def rollback_watchdog():
         os.remove(flag_path)
         # Keep backup dir for debugging
         logger.info(f"Upgrade watchdog: rollback to v{from_ver} complete, restarting...")
+        # Notify owner
+        try:
+            async with httpx.AsyncClient(timeout=10) as nc:
+                await nc.post(
+                    f"https://api.telegram.org/bot{NEW_BOT_TOKEN}/sendMessage",
+                    json={"chat_id": OWNER_ID, "text": f"🔄 **已回退到 v{from_ver}**\n\n新版启动失败，已自动恢复旧版本。"}
+                )
+        except Exception:
+            pass
         global _pending_restart, _stop_event
         _pending_restart = True
         if _stop_event:
