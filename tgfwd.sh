@@ -70,43 +70,29 @@ download_code() {
 }
 
 # ============================================================
-add_bot() {
+configure_ai() {
     echo ""
-    echo -n "  请输入 Bot Token（从 @BotFather 获取）: "
-    read -r BOT_TOKEN
-    if [ -z "$BOT_TOKEN" ]; then
-        echo -e "${RED}❌ Token 不能为空${NC}"
-        return 1
-    fi
-
-    echo -n "  请输入管理员 Telegram 用户ID（纯数字）: "
-    read -r OWNER_ID
-    if ! [[ "$OWNER_ID" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}❌ 用户ID 必须是纯数字${NC}"
-        return 1
-    fi
-
-    echo ""
-    echo "  ┌──────────────────────────────────────────────┐"
-    echo "  │  AI 智能识别功能说明                          │"
-    echo "  │                                              │"
-    echo "  │  • 自动判断广告/脏话，无需手动设关键词         │"
-    echo "  │  • 对脏话自动回骂（AI 生成犀利反击）          │"
-    echo "  │  • 对广告自动分级警告                         │"
-    echo "  │  • 10 条消息审核期，通过后直接转发             │"
-    echo "  │                                              │"
-    echo "  │  ⚠️  不启用 AI：只有关键词屏蔽，无智能识别    │"
-    echo "  │                                              │"
-    echo "  │  推荐 AI 平台：OpenRouter (openrouter.ai)     │"
-    echo "  │  大量免费模型，每天成本为 0                    │"
-    echo "  │  也支持 SiliconFlow (siliconflow.cn)            │"
-    echo "  │  国内优化，注册送额度                          │"
-    echo "  │                                              │"
-    echo "  │  每日费用：免费 ~ ¥0.5（视平台和消息量）        │"
-    echo "  └──────────────────────────────────────────────┘"
+    echo -e "${YELLOW}┌──────────────────────────────────────────────┐${NC}"
+    echo -e "${YELLOW}│  AI 智能识别功能说明                          │${NC}"
+    echo -e "${YELLOW}│                                              │${NC}"
+    echo -e "${YELLOW}│  • 自动判断广告/脏话，无需手动设关键词         │${NC}"
+    echo -e "${YELLOW}│  • 对脏话自动回骂（AI 生成犀利反击）          │${NC}"
+    echo -e "${YELLOW}│  • 对广告自动分级警告                         │${NC}"
+    echo -e "${YELLOW}│  • 10 条消息审核期，通过后直接转发             │${NC}"
+    echo -e "${YELLOW}│                                              │${NC}"
+    echo -e "${YELLOW}│  ⚠️  不启用 AI：只有关键词屏蔽，无智能识别    │${NC}"
+    echo -e "${YELLOW}│                                              │${NC}"
+    echo -e "${YELLOW}│  推荐 AI 平台：OpenRouter (openrouter.ai)     │${NC}"
+    echo -e "${YELLOW}│  大量免费模型，每天成本为 0                    │${NC}"
+    echo -e "${YELLOW}│  也支持 SiliconFlow (siliconflow.cn)            │${NC}"
+    echo -e "${YELLOW}│  国内优化，注册送额度                          │${NC}"
+    echo -e "${YELLOW}│                                              │${NC}"
+    echo -e "${YELLOW}│  每日费用：免费 ~ ¥0.5（视平台和消息量）        │${NC}"
+    echo -e "${YELLOW}└──────────────────────────────────────────────┘${NC}"
     echo ""
     echo -n "  是否启用 AI 智能识别 [y/N]: "
     read -r ENABLE_AI
+
     AI_ENABLED="false"
     AI_KEY=""
     AI_BASE=""
@@ -125,7 +111,6 @@ add_bot() {
         PLATFORM=${PLATFORM:-1}
 
         if [ "$PLATFORM" = "2" ]; then
-            # === SiliconFlow ===
             AI_PLATFORM="siliconflow"
             AI_BASE="https://api.siliconflow.cn/v1"
             echo ""
@@ -140,7 +125,6 @@ add_bot() {
             read -r INSULT_MODEL
             INSULT_MODEL=${INSULT_MODEL:-deepseek-ai/DeepSeek-V4-Flash}
         else
-            # === OpenRouter (默认) ===
             AI_PLATFORM="openrouter"
             AI_BASE="https://openrouter.ai/api/v1"
             echo ""
@@ -168,250 +152,588 @@ for m in models:
         ctx = str(m.get('context_length', '?'))[:7]
         free.append((pid, ctx))
 for i, (pid, ctx) in enumerate(free[:25], 1):
-    print(f'{i:>2}. {pid} (上下文:{ctx})')
-" 2>/dev/null)
+    print(f'    {i:2d}.  {pid}  (上下文: {ctx})')
+print('    提示：可以输入序号选择模型，也可以直接输入模型名')
+" 2>/dev/null || echo "    ⚠️  获取模型列表失败，请手动输入模型名")
 
-            if [ -n "$FREE_MODELS" ]; then
-                echo "$FREE_MODELS"
+            echo ""
+            echo "  $FREE_MODELS"
+            echo ""
+            echo -n "  分类模型 [默认 google/gemini-2.5-flash-lite]: "
+            read -r CLASSIFY_INPUT
+            if [ -z "$CLASSIFY_INPUT" ]; then
+                CLASSIFY_MODEL="google/gemini-2.5-flash-lite"
+            elif [[ "$CLASSIFY_INPUT" =~ ^[0-9]+$ ]]; then
+                CLASSIFY_MODEL=$(echo "$FREE_MODELS" | sed -n "${CLASSIFY_INPUT}p" | sed 's/^[[:space:]]*[0-9]*\. *//;s/(.*//' | xargs)
+                CLASSIFY_MODEL=${CLASSIFY_MODEL:-google/gemini-2.5-flash-lite}
+            else
+                CLASSIFY_MODEL="$CLASSIFY_INPUT"
             fi
 
-            echo ""
-            echo "  ┌─────────────────────────────────────────────┐"
-            echo "  │  🌟 推荐免费模型：                           │"
-            echo "  │                                             │"
-            echo "  │  分类模型 (轻量快速):                        │"
-            echo "  │    qwen/qwen3-next-80b-a3b-instruct:free      │"
-            echo "  │                                             │"
-            echo "  │  回骂模型 (犀利反击):                        │"
-            echo "  │    google/gemma-4-31b-it:free                │"
-            echo "  │                                             │"
-            echo "  │  你也可以输入上面列表中任意模型ID            │"
-            echo "  │  或任何 OpenRouter 支持的付费模型             │"
-            echo "  └─────────────────────────────────────────────┘"
-            echo ""
-            echo -n "  分类模型 [默认 qwen/qwen3-next-80b-a3b-instruct:free]: "
-            read -r CLASSIFY_MODEL
-            CLASSIFY_MODEL=${CLASSIFY_MODEL:-qwen/qwen3-next-80b-a3b-instruct:free}
-            echo -n "  回骂模型 [默认 google/gemma-4-31b-it:free]: "
-            read -r INSULT_MODEL
-            INSULT_MODEL=${INSULT_MODEL:-google/gemma-4-31b-it:free}
+            echo -n "  回骂模型 [默认 google/gemini-2.5-flash-lite]: "
+            read -r INSULT_INPUT
+            if [ -z "$INSULT_INPUT" ]; then
+                INSULT_MODEL="google/gemini-2.5-flash-lite"
+            elif [[ "$INSULT_INPUT" =~ ^[0-9]+$ ]]; then
+                INSULT_MODEL=$(echo "$FREE_MODELS" | sed -n "${INSULT_INPUT}p" | sed 's/^[[:space:]]*[0-9]*\. *//;s/(.*//' | xargs)
+                INSULT_MODEL=${INSULT_MODEL:-google/gemini-2.5-flash-lite}
+            else
+                INSULT_MODEL="$INSULT_INPUT"
+            fi
         fi
     fi
-
-    # 生成实例目录
-    INSTANCE_NAME="bot_${OWNER_ID}"
-    INSTANCE_PATH="$INSTALL_DIR/instances/$INSTANCE_NAME"
-    mkdir -p "$INSTANCE_PATH"
-
-    CONFIG_FILE="$INSTANCE_PATH/config.json"
-    cat > "$CONFIG_FILE" <<EOF
-{
-  "bot_token": "$BOT_TOKEN",
-  "owner_id": $OWNER_ID,
-  "ai": {
-    "enabled": $AI_ENABLED,
-    "platform": "$AI_PLATFORM",
-    "api_key": "$AI_KEY",
-    "base_url": "$AI_BASE",
-    "classify_model": "$CLASSIFY_MODEL",
-    "insult_model": "$INSULT_MODEL"
-  }
 }
-EOF
 
-    # 复制关键词文件到实例目录
-    if [ -f "$INSTALL_DIR/keywords.json" ]; then
-        cp "$INSTALL_DIR/keywords.json" "$INSTANCE_PATH/keywords.json"
-        echo "  ✅ 已复制 keywords.json"
+# ============================================================
+add_bot() {
+    echo ""
+    echo -n "  请输入 Bot Token（从 @BotFather 获取）: "
+    read -r BOT_TOKEN
+    if [ -z "$BOT_TOKEN" ]; then
+        echo -e "${RED}❌ Token 不能为空${NC}"
+        return 1
     fi
-    if [ -f "$INSTALL_DIR/keywords.example.json" ]; then
-        cp "$INSTALL_DIR/keywords.example.json" "$INSTANCE_PATH/keywords.example.json"
-        echo "  ✅ 已复制 keywords.example.json"
+
+    echo -n "  请输入管理员 Telegram 用户ID（纯数字）: "
+    read -r OWNER_ID
+    if ! [[ "$OWNER_ID" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}❌ 用户ID 必须是纯数字${NC}"
+        return 1
     fi
 
-    echo -e "${GREEN}✅ 机器人已配置: $INSTANCE_NAME${NC}"
-    echo "  配置文件: $CONFIG_FILE"
+    configure_ai
 
-    # 启用 systemd 服务（开机自启），但不立即启动
-    systemctl enable "tg-forwarder@$INSTANCE_NAME" 2>/dev/null
-    echo "  已设置开机自启"
+    INSTANCE_DIR="$INSTALL_DIR/instances/bot_${OWNER_ID}"
+    mkdir -p "$INSTANCE_DIR"
 
-    return 0
+    echo -e "${BLUE}[*] 生成配置文件...${NC}"
+    python3 -c "
+import json, os, shutil
+
+cfg_path = '$INSTANCE_DIR/config.json'
+base_cfg_path = '$INSTALL_DIR/config.example.json'
+kwd_path = '$INSTANCE_DIR/keywords.json'
+kwd_src = '$INSTALL_DIR/keywords.example.json'
+
+if os.path.exists(base_cfg_path):
+    with open(base_cfg_path) as f:
+        cfg = json.load(f)
+else:
+    cfg = {}
+
+cfg['bot_token'] = '$BOT_TOKEN'
+cfg['owner_id'] = int('$OWNER_ID')
+
+# AI settings
+if '$AI_ENABLED' == 'true':
+    cfg.setdefault('ai', {})
+    cfg['ai']['enabled'] = True
+    if '$AI_KEY':
+        cfg['ai']['api_key'] = '$AI_KEY'
+    if '$AI_BASE':
+        cfg['ai']['base_url'] = '$AI_BASE'
+    if '$AI_PLATFORM':
+        cfg['ai']['platform'] = '$AI_PLATFORM'
+    if '$CLASSIFY_MODEL':
+        cfg['ai']['classify_model'] = '$CLASSIFY_MODEL'
+    if '$INSULT_MODEL':
+        cfg['ai']['insult_model'] = '$INSULT_MODEL'
+
+with open(cfg_path, 'w') as f:
+    json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+# Copy keywords
+if os.path.exists(kwd_src):
+    shutil.copy(kwd_src, kwd_path)
+elif os.path.exists('$INSTALL_DIR/keywords.json'):
+    shutil.copy('$INSTALL_DIR/keywords.json', kwd_path)
+
+print('Done')
+"
+
+    echo -e "${GREEN}✅ 机器人配置完成: $INSTANCE_DIR${NC}"
 }
 
 # ============================================================
 start_bot() {
-    local conf="$1"
-    local name="$(basename $(dirname $conf))"
-    echo -e "${BLUE}[*] 启动机器人: $name${NC}"
+    local CONF="${1:-}"
+    if [ -z "$CONF" ]; then
+        echo -e "${RED}❌ 未指定配置文件${NC}"
+        return 1
+    fi
 
-    systemctl start "tg-forwarder@$name" 2>/dev/null
-    sleep 1
-    if systemctl is-active --quiet "tg-forwarder@$name"; then
-        echo -e "${GREEN}  ✅ 启动成功${NC}"
+    local TAG=$(python3 -c "import hashlib, os; print(hashlib.md5(os.path.abspath('$CONF').encode()).hexdigest()[:8])")
+    local SVC_NAME="tg-forwarder@${TAG}"
+
+    # Check if already running
+    if systemctl --user is-active "$SVC_NAME" &>/dev/null 2>&1; then
+        echo -e "${YELLOW}  机器人已在运行: $SVC_NAME${NC}"
+        return 0
+    fi
+
+    # Detect service type (user or system)
+    local SCOPE=""
+    if systemctl --user status "$SVC_NAME" &>/dev/null 2>&1 || [ -d "$HOME/.config/systemd/user" ]; then
+        SCOPE="user"
+    elif [ -w "/etc/systemd/system" ]; then
+        SCOPE="system"
     else
-        echo -e "${RED}  ❌ 启动失败，查看: systemctl status tg-forwarder@$name${NC}"
+        SCOPE="user"
+    fi
+
+    if [ "$SCOPE" = "user" ]; then
+        mkdir -p "$HOME/.config/systemd/user"
+        cat > "$HOME/.config/systemd/user/${SVC_NAME}.service" << UNIT
+[Unit]
+Description=TG Forwarder Bot (${TAG})
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$INSTALL_DIR
+ExecStart=/usr/bin/python3 $INSTALL_DIR/forwarder.py $CONF
+Restart=always
+RestartSec=5
+Environment=HOME=$HOME
+StandardOutput=append:$INSTALL_DIR/logs/${TAG}.log
+StandardError=append:$INSTALL_DIR/logs/${TAG}.log
+
+[Install]
+WantedBy=default.target
+UNIT
+        systemctl --user daemon-reload
+        systemctl --user enable "$SVC_NAME" 2>/dev/null
+        systemctl --user start "$SVC_NAME" 2>/dev/null || {
+            echo -e "${YELLOW}  ⚠️  user systemd 启动失败，尝试后台运行${NC}"
+            nohup python3 "$INSTALL_DIR/forwarder.py" "$CONF" >> "$INSTALL_DIR/logs/${TAG}.log" 2>&1 &
+        }
+    else
+        cat > "/etc/systemd/system/${SVC_NAME}.service" << UNIT
+[Unit]
+Description=TG Forwarder Bot (${TAG})
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$INSTALL_DIR
+ExecStart=/usr/bin/python3 $INSTALL_DIR/forwarder.py $CONF
+Restart=always
+RestartSec=5
+User=$USER
+StandardOutput=append:$INSTALL_DIR/logs/${TAG}.log
+StandardError=append:$INSTALL_DIR/logs/${TAG}.log
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+        systemctl daemon-reload
+        systemctl enable "$SVC_NAME" 2>/dev/null
+        systemctl start "$SVC_NAME"
+    fi
+
+    sleep 2
+    if systemctl --$SCOPE is-active "$SVC_NAME" &>/dev/null 2>&1; then
+        echo -e "${GREEN}✅ 机器人已启动: $SVC_NAME${NC}"
+    else
+        echo -e "${YELLOW}  ⚠️  服务可能未正常启动，请检查日志: tail -f $INSTALL_DIR/logs/${TAG}.log${NC}"
     fi
 }
 
 # ============================================================
 stop_bot() {
-    local conf="$1"
-    local name="$(basename $(dirname $conf))"
-    if systemctl is-active --quiet "tg-forwarder@$name"; then
-        systemctl stop "tg-forwarder@$name"
-        echo -e "${GREEN}✅ 已停止${NC}"
+    local TAG="$1"
+    if [ -z "$TAG" ]; then
+        echo -e "${RED}❌ 未指定机器人${NC}"
+        return 1
+    fi
+    local SVC_NAME="tg-forwarder@${TAG}"
+
+    if systemctl --user is-active "$SVC_NAME" &>/dev/null 2>&1; then
+        systemctl --user stop "$SVC_NAME" 2>/dev/null
+        systemctl --user disable "$SVC_NAME" 2>/dev/null
+        rm -f "$HOME/.config/systemd/user/${SVC_NAME}.service"
+        systemctl --user daemon-reload
+        echo -e "${GREEN}✅ 已停止用户服务: $SVC_NAME${NC}"
+    elif systemctl is-active "$SVC_NAME" &>/dev/null 2>&1; then
+        systemctl stop "$SVC_NAME"
+        systemctl disable "$SVC_NAME" 2>/dev/null
+        rm -f "/etc/systemd/system/${SVC_NAME}.service"
+        systemctl daemon-reload
+        echo -e "${GREEN}✅ 已停止系统服务: $SVC_NAME${NC}"
     else
-        echo -e "${YELLOW}⚠️  未在运行${NC}"
+        echo -e "${YELLOW}  服务未在运行: $SVC_NAME${NC}"
     fi
 }
 
 # ============================================================
-# 主菜单
+list_bots() {
+    echo ""
+    echo -e "${BLUE}=== 已配置的机器人 ===${NC}"
+    if [ -d "$INSTALL_DIR/instances" ]; then
+        for d in "$INSTALL_DIR/instances"/bot_*; do
+            if [ -f "$d/config.json" ]; then
+                local TAG=$(python3 -c "import hashlib, os; print(hashlib.md5(os.path.abspath('$d/config.json').encode()).hexdigest()[:8])")
+                local SVC="tg-forwarder@${TAG}"
+                local STATUS="已停止"
+                if systemctl --user is-active "$SVC" &>/dev/null 2>&1; then
+                    STATUS="运行中 (user)"
+                elif systemctl is-active "$SVC" &>/dev/null 2>&1; then
+                    STATUS="运行中 (system)"
+                fi
+                local OWNER=$(python3 -c "
+import json
+try:
+    with open('$d/config.json') as f:
+        d = json.load(f)
+    print(d.get('owner_id', '?'))
+except:
+    print('?')
+" 2>/dev/null)
+                echo "  📱 bot_${OWNER}  [${TAG}]  ${STATUS}"
+            fi
+        done
+    fi
+    echo ""
+}
+
+# ============================================================
+remove_bot() {
+    list_bots
+    echo -n "  请输入要删除的机器人 owner_id: "
+    read -r OID
+    if [ -z "$OID" ]; then
+        echo -e "${RED}❌ 输入无效${NC}"
+        return 1
+    fi
+
+    local DIR="$INSTALL_DIR/instances/bot_${OID}"
+    if [ ! -d "$DIR" ]; then
+        echo -e "${RED}❌ 未找到机器人 bot_${OID}${NC}"
+        return 1
+    fi
+
+    local TAG=$(python3 -c "import hashlib, os; print(hashlib.md5(os.path.abspath('$DIR/config.json').encode()).hexdigest()[:8])")
+    stop_bot "$TAG"
+
+    echo -n "  是否删除配置数据（含关键词、状态、日志）？[y/N]: "
+    read -r DELDATA
+    if [[ "$DELDATA" =~ ^[Yy]$ ]]; then
+        rm -rf "$DIR"
+        echo -e "${GREEN}✅ 已删除 bot_${OID} 全部数据${NC}"
+    else
+        echo -e "${YELLOW}  保留数据目录: $DIR${NC}"
+    fi
+}
+
+# ============================================================
+edit_ai() {
+    echo ""
+    echo -e "${BLUE}=== 修改 AI 配置 ===${NC}"
+    echo "  选择要修改的机器人："
+    echo "  0) 返回"
+    local BOTS=()
+    local i=1
+    if [ -d "$INSTALL_DIR/instances" ]; then
+        for d in "$INSTALL_DIR/instances"/bot_*; do
+            if [ -f "$d/config.json" ]; then
+                local OID=$(python3 -c "import json; print(json.load(open('$d/config.json')).get('owner_id','?'))" 2>/dev/null)
+                echo "  $i) bot_${OID}"
+                BOTS+=("$d/config.json")
+                ((i++))
+            fi
+        done
+    fi
+    if [ ${#BOTS[@]} -eq 0 ]; then
+        echo "  没有已配置的机器人"
+        return
+    fi
+    echo -n "  请选择: "
+    read -r CHOICE
+    if [ "$CHOICE" = "0" ] || [ -z "$CHOICE" ]; then
+        return
+    fi
+    local IDX=$((CHOICE - 1))
+    if [ "$IDX" -ge 0 ] && [ "$IDX" -lt ${#BOTS[@]} ]; then
+        local CONF="${BOTS[$IDX]}"
+        echo ""
+        echo -e "${YELLOW}当前 AI 配置：${NC}"
+        python3 -c "
+import json
+with open('$CONF') as f:
+    cfg = json.load(f)
+ai = cfg.get('ai', {})
+print(f'  平台: {ai.get(\"platform\", \"未设置\")}')
+print(f'  API密钥: {\"已设置\" if ai.get(\"api_key\") else \"未设置（仅限免费模型）\"}')
+print(f'  Base URL: {ai.get(\"base_url\", \"未设置\")}')
+print(f'  分类模型: {ai.get(\"classify_model\", \"未设置\")}')
+print(f'  回骂模型: {ai.get(\"insult_model\", \"未设置\")}')
+print(f'  AI开关: {\"开启\" if ai.get(\"enabled\") else \"关闭\"}')
+"
+
+        echo ""
+        echo "  要修改什么？"
+        echo "    1) 更换 AI 平台/API密钥/模型"
+        echo "    2) 开关 AI 功能"
+        echo "    0) 返回"
+        echo -n "  请选择: "
+        read -r SUB
+        if [ "$SUB" = "1" ]; then
+            configure_ai
+            echo -n "  是否保存并重启机器人？[Y/n]: "
+            read -r SAVE
+            if [[ ! "$SAVE" =~ ^[Nn]$ ]]; then
+                local INST_DIR=$(dirname "$CONF")
+                python3 -c "
+import json
+with open('$CONF') as f:
+    cfg = json.load(f)
+cfg.setdefault('ai', {})
+if '$AI_ENABLED' == 'true':
+    cfg['ai']['enabled'] = True
+    if '$AI_KEY':
+        cfg['ai']['api_key'] = '$AI_KEY'
+    if '$AI_BASE':
+        cfg['ai']['base_url'] = '$AI_BASE'
+    if '$AI_PLATFORM':
+        cfg['ai']['platform'] = '$AI_PLATFORM'
+    if '$CLASSIFY_MODEL':
+        cfg['ai']['classify_model'] = '$CLASSIFY_MODEL'
+    if '$INSULT_MODEL':
+        cfg['ai']['insult_model'] = '$INSULT_MODEL'
+else:
+    cfg['ai']['enabled'] = False
+with open('$CONF', 'w') as f:
+    json.dump(cfg, f, ensure_ascii=False, indent=2)
+print('Saved')
+"
+                local TAG=$(python3 -c "import hashlib, os; print(hashlib.md5(os.path.abspath('$CONF').encode()).hexdigest()[:8])")
+                local SVC="tg-forwarder@${TAG}"
+                if systemctl --user is-active "$SVC" &>/dev/null 2>&1; then
+                    systemctl --user restart "$SVC"
+                elif systemctl is-active "$SVC" &>/dev/null 2>&1; then
+                    systemctl restart "$SVC"
+                fi
+                echo -e "${GREEN}✅ AI 配置已更新并重启${NC}"
+            else
+                echo -e "${YELLOW}  配置未保存${NC}"
+            fi
+        elif [ "$SUB" = "2" ]; then
+            # Toggle AI on/off
+            python3 -c "
+import json
+with open('$CONF') as f:
+    cfg = json.load(f)
+ai = cfg.setdefault('ai', {})
+current = ai.get('enabled', False)
+ai['enabled'] = not current
+with open('$CONF', 'w') as f:
+    json.dump(cfg, f, ensure_ascii=False, indent=2)
+print('ON' if ai['enabled'] else 'OFF')
+" > /tmp/ai_toggle_result
+            local TOGGLE=$(cat /tmp/ai_toggle_result 2>/dev/null)
+            local TAG=$(python3 -c "import hashlib, os; print(hashlib.md5(os.path.abspath('$CONF').encode()).hexdigest()[:8])")
+            local SVC="tg-forwarder@${TAG}"
+            if systemctl --user is-active "$SVC" &>/dev/null 2>&1; then
+                systemctl --user restart "$SVC"
+            elif systemctl is-active "$SVC" &>/dev/null 2>&1; then
+                systemctl restart "$SVC"
+            fi
+            if [ "$TOGGLE" = "ON" ]; then
+                echo -e "${GREEN}✅ AI 功能已开启并重启${NC}"
+            else
+                echo -e "${GREEN}✅ AI 功能已关闭并重启${NC}"
+            fi
+            rm -f /tmp/ai_toggle_result
+        fi
+    fi
+}
+
+# ============================================================
+toggle_features() {
+    echo ""
+    echo -e "${BLUE}=== 开关功能 ===${NC}"
+    echo "  选择要操作机器人："
+    echo "  0) 返回"
+    local BOTS=()
+    local i=1
+    if [ -d "$INSTALL_DIR/instances" ]; then
+        for d in "$INSTALL_DIR/instances"/bot_*; do
+            if [ -f "$d/config.json" ]; then
+                local OID=$(python3 -c "import json; print(json.load(open('$d/config.json')).get('owner_id','?'))" 2>/dev/null)
+                echo "  $i) bot_${OID}"
+                BOTS+=("$d/config.json")
+                ((i++))
+            fi
+        done
+    fi
+    if [ ${#BOTS[@]} -eq 0 ]; then
+        echo "  没有已配置的机器人"
+        return
+    fi
+    echo -n "  请选择: "
+    read -r CHOICE
+    if [ "$CHOICE" = "0" ] || [ -z "$CHOICE" ]; then
+        return
+    fi
+    local IDX=$((CHOICE - 1))
+    if [ "$IDX" -lt 0 ] || [ "$IDX" -ge ${#BOTS[@]} ]; then
+        return
+    fi
+    local CONF="${BOTS[$IDX]}"
+
+    echo ""
+    echo "  功能开关："
+    echo "    1) AI 智能识别    (开关)"
+    echo "    2) 关键词屏蔽     (开关)"
+    echo "    3) 脏话回骂       (开关)"
+    echo "    4) 广告警告       (开关)"
+    echo "    0) 返回"
+    echo -n "  请选择: "
+    read -r SUB
+
+    local KEY=""
+    local LABEL=""
+    case "$SUB" in
+        1) KEY="ai.enabled"; LABEL="AI 智能识别" ;;
+        2) KEY="keyword_enabled"; LABEL="关键词屏蔽" ;;
+        3) KEY="insult_enabled"; LABEL="脏话回骂" ;;
+        4) KEY="ad_warning_enabled"; LABEL="广告警告" ;;
+        0) return ;;
+        *) return ;;
+    esac
+
+    # Toggle
+    local TAG=$(python3 -c "import hashlib, os; print(hashlib.md5(os.path.abspath('$CONF').encode()).hexdigest()[:8])")
+    local SVC="tg-forwarder@${TAG}"
+    local MAIN_KEY=$(echo "$KEY" | cut -d. -f1)
+    local SUB_KEY=$(echo "$KEY" | cut -d. -f2)
+
+    python3 -c "
+import json
+with open('$CONF') as f:
+    cfg = json.load(f)
+section = cfg.setdefault('$MAIN_KEY', {})
+if isinstance(section, dict):
+    current = section.get('$SUB_KEY', True)
+    section['$SUB_KEY'] = not current
+    new_state = not current
+else:
+    new_state = not section
+    cfg['$MAIN_KEY'] = new_state
+with open('$CONF', 'w') as f:
+    json.dump(cfg, f, ensure_ascii=False, indent=2)
+print('ON' if new_state else 'OFF')
+" > /tmp/feature_toggle_result
+    local STATE=$(cat /tmp/feature_toggle_result 2>/dev/null)
+    rm -f /tmp/feature_toggle_result
+
+    # Restart
+    if systemctl --user is-active "$SVC" &>/dev/null 2>&1; then
+        systemctl --user restart "$SVC"
+    elif systemctl is-active "$SVC" &>/dev/null 2>&1; then
+        systemctl restart "$SVC"
+    fi
+
+    if [ "$STATE" = "ON" ]; then
+        echo -e "${GREEN}✅ ${LABEL} 已开启并重启${NC}"
+    else
+        echo -e "${GREEN}✅ ${LABEL} 已关闭并重启${NC}"
+    fi
+}
+
+# ============================================================
+detect_install_method() {
+    # Returns: docker | user | system | none
+    for d in "$INSTALL_DIR/instances"/bot_*; do
+        if [ -f "$d/config.json" ]; then
+            local TAG=$(python3 -c "import hashlib, os; print(hashlib.md5(os.path.abspath('$d/config.json').encode()).hexdigest()[:8])" 2>/dev/null)
+            if systemctl --user is-enabled "tg-forwarder@${TAG}" &>/dev/null 2>&1; then
+                echo "user"
+                return
+            elif systemctl is-enabled "tg-forwarder@${TAG}" &>/dev/null 2>&1; then
+                echo "system"
+                return
+            fi
+        fi
+    done
+    if docker compose version &>/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -q 'tgforwarder'; then
+        echo "docker"
+        return
+    fi
+    echo "none"
+}
+
+# ============================================================
+# Main menu (for already installed users)
 # ============================================================
 main_menu() {
     while true; do
         echo ""
-        echo -e "${GREEN}========================================${NC}"
-        echo -e "${GREEN}  Telegram 消息转发机器人 - 管理菜单${NC}"
-        echo -e "${GREEN}========================================${NC}"
+        echo -e "${BLUE}========================================${NC}"
+        echo -e "${BLUE}  管理菜单${NC}"
+        echo -e "${BLUE}========================================${NC}"
+        local METHOD=$(detect_install_method)
+        echo "  安装方式: $METHOD"
         echo ""
-        echo "  1) 添加新机器人"
-        echo "  2) 查看所有机器人"
-        echo "  3) 启动单个机器人"
-        echo "  4) 停止单个机器人"
-        echo "  5) 启动全部机器人"
-        echo "  6) 停止全部机器人"
-        echo "  7) 删除机器人配置"
-        echo "  8) 更新项目代码"
+        echo "  1) 查看已配置机器人列表"
+        echo "  2) 添加新机器人"
+        echo "  3) 删除机器人"
+        echo "  4) 重启所有机器人"
+        echo "  5) 修改 AI 配置"
+        echo "  6) 开关功能"
+        echo "  7) 更新程序 (git pull)"
         echo "  0) 退出"
         echo ""
-        echo -n "  请选择 [0-8]: "
+        echo -n "  请选择 [0-7]: "
         read -r CHOICE
 
         case "$CHOICE" in
             1)
-                add_bot || true
+                list_bots
                 ;;
             2)
-                echo ""
-                echo -e "${BLUE}已配置的机器人:${NC}"
-                if [ -d "$INSTALL_DIR/instances" ]; then
-                    for d in "$INSTALL_DIR/instances"/bot_*/; do
-                        if [ -f "${d}config.json" ]; then
-                            name=$(basename "$d")
-                            conf="${d}config.json"
-                            if systemctl is-active --quiet "tg-forwarder@$name"; then
-                                status="${GREEN}运行中${NC}"
-                            else
-                                status="${RED}已停止${NC}"
-                            fi
-                            echo -e "  $name → $status"
-                        fi
-                    done
+                if [ "$METHOD" = "docker" ]; then
+                    echo -e "${YELLOW}⚠️  Docker 环境请通过 docker compose 管理${NC}"
                 else
-                    echo "  (暂无)"
+                    add_bot
+                    echo ""
+                    echo -n "  是否立即启动? [Y/n]: "
+                    read -r START_NOW
+                    if [[ ! "$START_NOW" =~ ^[Nn]$ ]]; then
+                        local conf="$INSTALL_DIR/instances/bot_${OWNER_ID}/config.json"
+                        start_bot "$conf"
+                    fi
                 fi
                 ;;
             3)
-                echo -n "  输入要启动的机器人名称 (如 bot_123456789): "
-                read -r name
-                conf="$INSTALL_DIR/instances/$name/config.json"
-                if [ -f "$conf" ]; then
-                    start_bot "$conf"
-                else
-                    echo -e "${RED}❌ 未找到配置: $conf${NC}"
-                fi
+                remove_bot
                 ;;
             4)
-                echo -n "  输入要停止的机器人名称 (如 bot_123456789): "
-                read -r name
-                conf="$INSTALL_DIR/instances/$name/config.json"
-                if [ -f "$conf" ]; then
-                    stop_bot "$conf"
-                else
-                    echo -e "${RED}❌ 未找到配置: $conf${NC}"
-                fi
+                echo -e "${BLUE}[*] 重启所有机器人...${NC}"
+                for svc in $(systemctl list-units --all --no-legend "tg-forwarder@*" 2>/dev/null | awk '{print $1}'); do
+                    systemctl restart "$svc" 2>/dev/null && echo "    ✅ $svc"
+                done
+                for svc in $(systemctl --user list-units --all --no-legend "tg-forwarder@*" 2>/dev/null | awk '{print $1}'); do
+                    systemctl --user restart "$svc" 2>/dev/null && echo "    ✅ $svc"
+                done
+                echo -e "${GREEN}✅ 完成${NC}"
                 ;;
             5)
-                if [ -d "$INSTALL_DIR/instances" ]; then
-                    for conf in "$INSTALL_DIR/instances"/bot_*/config.json; do
-                        [ -f "$conf" ] && start_bot "$conf"
-                    done
-                fi
-                echo -e "${GREEN}✅ 全部启动完成${NC}"
+                edit_ai
                 ;;
             6)
-                pids=$(pgrep -f "forwarder.py" 2>/dev/null)
-                if [ -n "$pids" ]; then
-                    echo "$pids" | xargs kill 2>/dev/null
-                    echo -e "${GREEN}✅ 已停止全部机器人${NC}"
-                else
-                    echo -e "${YELLOW}⚠️  没有运行中的机器人${NC}"
-                fi
+                toggle_features
                 ;;
             7)
-                echo -n "  输入要删除的机器人名称 (如 bot_123456789): "
-                read -r name
-                if [ -d "$INSTALL_DIR/instances/$name" ]; then
-                    # 先停掉
-                    conf="$INSTALL_DIR/instances/$name/config.json"
-                    [ -f "$conf" ] && stop_bot "$conf"
-                    # 移动备份
-                    mv "$INSTALL_DIR/instances/$name" "$INSTALL_DIR/instances/${name}.deleted.$(date +%Y%m%d%H%M%S)"
-                    echo -e "${GREEN}✅ 已删除（配置文件已备份）${NC}"
-                else
-                    echo -e "${RED}❌ 未找到机器人: $name${NC}"
-                fi
-                ;;
-            8)
-                echo -e "${BLUE}[*] 检查最新正式发布版本...${NC}"
+                echo -e "${BLUE}[*] 更新代码...${NC}"
                 cd "$INSTALL_DIR"
-                # Fetch latest release tag from GitHub API
-                LATEST=$(curl -sL https://api.github.com/repos/dkgks/tgforwarder/releases/latest 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('tag_name',''))" 2>/dev/null)
-                if [ -z "$LATEST" ]; then
-                    echo -e "${RED}❌ 无法获取最新版本信息，请检查网络后重试${NC}"
-                    cd - >/dev/null
-                    continue
-                else
-                    CURRENT=$(git describe --tags --abbrev=0 2>/dev/null || echo "(未知)")
-                    echo "  当前版本: $CURRENT"
-                    echo "  最新版本: $LATEST"
-                    if [ "$CURRENT" = "$LATEST" ]; then
-                        echo -e "${GREEN}  ✅ 已是最新版本，无需更新${NC}"
-                    else
-                        echo -e "${BLUE}[*] 从 GitHub Releases 下载 $LATEST ...${NC}"
-                        TMPDIR=$(mktemp -d)
-                        # Download zipball, extract, and move code files only
-                        curl -sL "https://github.com/dkgks/tgforwarder/archive/refs/tags/$LATEST.tar.gz" -o "$TMPDIR/release.tar.gz"
-                        tar xzf "$TMPDIR/release.tar.gz" -C "$TMPDIR"
-                        # Find the extracted directory (prefix varies)
-                        SRC=$(find "$TMPDIR" -maxdepth 1 -type d -name "tgforwarder-*" | head -1)
-                        if [ -d "$SRC" ]; then
-                            # Only copy code files (.py .sh .example.json), never data files
-                            echo "  正在更新代码文件..."
-                            for f in forwarder.py weekly_report.py tgfwd.sh keywords.example.json config.example.json; do
-                                if [ -f "$SRC/$f" ]; then
-                                    cp "$SRC/$f" "$INSTALL_DIR/$f"
-                                    echo "    ✅ $f"
-                                fi
-                            done
-                            # Update .gitignore too
-                            [ -f "$SRC/.gitignore" ] && cp "$SRC/.gitignore" "$INSTALL_DIR/.gitignore" && echo "    ✅ .gitignore"
-                            # Sync git tag to local repo for version tracking
-                            git fetch origin --tags 2>/dev/null || true
-                            echo -e "${GREEN}✅ 更新到 $LATEST 完成${NC}"
-                            echo -e "${YELLOW}  💡 你的 config.json、keywords.json、state.json 等数据文件未被修改${NC}"
-                        else
-                            echo -e "${RED}❌ 解包失败，更新终止${NC}"
-                        fi
-                        rm -rf "$TMPDIR"
-                    fi
-                fi
-                # 重启所有运行中的机器人
-                echo -e "${BLUE}[*] 重启运行中的机器人...${NC}"
+                git pull --ff-only origin main 2>/dev/null && echo -e "${GREEN}✅ 更新完成${NC}" || echo -e "${YELLOW}⚠️  更新失败${NC}"
+                # Restart all
                 for svc in $(systemctl list-units --all --no-legend "tg-forwarder@*" 2>/dev/null | awk '{print $1}'); do
-                    systemctl restart "$svc" && echo "    ✅ $svc"
+                    systemctl restart "$svc" 2>/dev/null
+                done
+                for svc in $(systemctl --user list-units --all --no-legend "tg-forwarder@*" 2>/dev/null | awk '{print $1}'); do
+                    systemctl --user restart "$svc" 2>/dev/null
                 done
                 cd - >/dev/null
                 ;;
@@ -427,66 +749,183 @@ main_menu() {
 }
 
 # ============================================================
-# 首次安装入口
+# First-time setup
 # ============================================================
 first_setup() {
     print_banner
 
     echo "本脚本将完成以下步骤："
-    echo "  1. 检查 Python 环境"
-    echo "  2. 安装依赖包"
-    echo "  3. 下载项目代码"
-    echo "  4. 配置第一个机器人"
-    echo "  5. 启动机器人"
+    echo "  1. 检查环境"
+    echo "  2. 安装依赖"
+    echo "  3. 下载代码"
+    echo "  4. 配置机器人"
+    echo "  5. 启动服务"
     echo ""
-    echo -n "是否继续? [Y/n]: "
-    read -r CONFIRM
-    if [[ "$CONFIRM" =~ ^[Nn]$ ]]; then
-        echo "已取消"
-        exit 0
-    fi
+    echo "  选择安装方式："
+    echo "    1) ★ 推荐：系统服务 (systemd，开机自启，崩溃自动重启)"
+    echo "    2) Docker (需已安装 Docker + docker compose)"
+    echo "    3) 后台进程 (简单，但重启后不会自动启动)"
+    echo ""
+    echo -n "  请选择 [1]: "
+    read -r METHOD
+    METHOD=${METHOD:-1}
 
-    check_python
-    install_deps
-    download_code
+    case "$METHOD" in
+        2)
+            # Docker install
+            if ! command -v docker &>/dev/null; then
+                echo -e "${RED}❌ 未检测到 Docker，请先安装${NC}"
+                exit 1
+            fi
+            if ! docker compose version &>/dev/null 2>&1; then
+                echo -e "${RED}❌ 未检测到 docker compose 插件${NC}"
+                exit 1
+            fi
 
-    mkdir -p "$INSTALL_DIR/logs"
-    mkdir -p "$INSTALL_DIR/instances"
+            echo -n "  请输入 Bot Token（从 @BotFather 获取）: "
+            read -r BOT_TOKEN
+            echo -n "  请输入管理员 Telegram 用户ID: "
+            read -r OWNER_ID
 
-    echo ""
-    echo -e "${GREEN}========================================${NC}"
-    echo -e "${GREEN}  配置第一个机器人${NC}"
-    echo -e "${GREEN}========================================${NC}"
-    add_bot
+            if ! command -v git &>/dev/null; then
+                echo -e "${RED}❌ 请先安装 git${NC}"
+                exit 1
+            fi
 
-    echo ""
-    echo -n "是否立即启动? [Y/n]: "
-    read -r START_NOW
-    if [[ ! "$START_NOW" =~ ^[Nn]$ ]]; then
-        conf="$INSTALL_DIR/instances/bot_${OWNER_ID}/config.json"
-        start_bot "$conf"
-    fi
+            if [ -d "tgforwarder" ]; then
+                cd tgforwarder
+                git pull origin main 2>/dev/null || true
+                cd - >/dev/null
+            else
+                git clone "$GIT_REPO"
+            fi
 
-    echo ""
-    echo -e "${GREEN}========================================${NC}"
-    echo -e "${GREEN}  安装完成！${NC}"
-    echo -e "${GREEN}========================================${NC}"
-    echo ""
-    echo "  管理菜单: bash $INSTALL_DIR/tgfwd.sh"
-    echo "  手动运行: python3 $INSTALL_DIR/forwarder.py 实例路径/config.json"
-    echo "  Bot Token 获取: https://t.me/BotFather"
-    echo "  用户ID 获取: https://t.me/userinfobot"
-    echo "  OpenRouter API 密钥: https://openrouter.ai"
-    echo "  SiliconFlow API 密钥: https://siliconflow.cn"
-    echo ""
+            cd tgforwarder
+            mkdir -p data
+            python3 -c "
+import json
+with open('config.example.json') as f:
+    cfg = json.load(f)
+cfg['bot_token'] = '$BOT_TOKEN'
+cfg['owner_id'] = int('$OWNER_ID')
+with open('data/config.json', 'w') as f:
+    json.dump(cfg, f, ensure_ascii=False, indent=2)
+"
+
+            echo ""
+            configure_ai
+
+            if [ "$AI_ENABLED" = "true" ]; then
+                python3 -c "
+import json
+with open('data/config.json') as f:
+    cfg = json.load(f)
+cfg.setdefault('ai', {})
+cfg['ai']['enabled'] = True
+if '$AI_KEY': cfg['ai']['api_key'] = '$AI_KEY'
+if '$AI_BASE': cfg['ai']['base_url'] = '$AI_BASE'
+if '$AI_PLATFORM': cfg['ai']['platform'] = '$AI_PLATFORM'
+if '$CLASSIFY_MODEL': cfg['ai']['classify_model'] = '$CLASSIFY_MODEL'
+if '$INSULT_MODEL': cfg['ai']['insult_model'] = '$INSULT_MODEL'
+with open('data/config.json', 'w') as f:
+    json.dump(cfg, f, ensure_ascii=False, indent=2)
+"
+            fi
+
+            docker compose up -d
+            echo -e "${GREEN}========================================${NC}"
+            echo -e "${GREEN}  🎉 Docker 部署完成！${NC}"
+            echo -e "${GREEN}========================================${NC}"
+            echo "  📱 发送 /menu 给机器人打开管理面板"
+            echo "  📋 docker compose logs -f"
+            echo "  🔄 docker compose restart"
+            echo "  🛑 docker compose down"
+            cd - >/dev/null
+            ;;
+
+        3)
+            # Background process install
+            check_python
+            install_deps
+            download_code
+
+            add_bot
+            echo ""
+            echo -n "  是否立即启动? [Y/n]: "
+            read -r START_NOW
+            if [[ ! "$START_NOW" =~ ^[Nn]$ ]]; then
+                local conf="$INSTALL_DIR/instances/bot_${OWNER_ID}/config.json"
+                nohup python3 "$INSTALL_DIR/forwarder.py" "$conf" >> "$INSTALL_DIR/logs/bg.log" 2>&1 &
+                echo -e "${GREEN}✅ 后台已启动 (PID $!)${NC}"
+                echo -e "${YELLOW}⚠️  关闭终端后服务会停止。下次启动使用管理脚本${NC}"
+            fi
+            echo ""
+            echo -e "${GREEN}管理: bash $INSTALL_DIR/tgfwd.sh${NC}"
+            ;;
+
+        *)
+            # Default: systemd service install
+            check_python
+            install_deps
+            download_code
+
+            mkdir -p "$INSTALL_DIR/logs"
+            mkdir -p "$INSTALL_DIR/instances"
+
+            echo ""
+            echo -e "${GREEN}========================================${NC}"
+            echo -e "${GREEN}  配置第一个机器人${NC}"
+            echo -e "${GREEN}========================================${NC}"
+            add_bot
+
+            echo ""
+            echo -n "  是否立即启动? [Y/n]: "
+            read -r START_NOW
+            if [[ ! "$START_NOW" =~ ^[Nn]$ ]]; then
+                conf="$INSTALL_DIR/instances/bot_${OWNER_ID}/config.json"
+                start_bot "$conf"
+            fi
+
+            echo ""
+            echo -e "${GREEN}========================================${NC}"
+            echo -e "${GREEN}  安装完成！${NC}"
+            echo -e "${GREEN}========================================${NC}"
+            echo ""
+            echo "  管理菜单: bash $INSTALL_DIR/tgfwd.sh"
+            echo "  手动运行: python3 $INSTALL_DIR/forwarder.py 实例路径/config.json"
+            echo "  Bot Token 获取: https://t.me/BotFather"
+            echo "  用户ID 获取: https://t.me/userinfobot"
+            echo "  OpenRouter API 密钥: https://openrouter.ai"
+            echo "  SiliconFlow API 密钥: https://siliconflow.cn"
+            ;;
+
+    esac
 }
 
 # ============================================================
-# 入口判断
+# Entry point
 # ============================================================
+print_banner
+
 if [ ! -d "$INSTALL_DIR" ]; then
     first_setup
 else
-    print_banner
-    main_menu
+    echo ""
+    METHOD=$(detect_install_method)
+    if [ "$METHOD" = "none" ]; then
+        echo -e "${YELLOW}⚠️  检测到已安装但未找到运行中的服务。${NC}"
+        echo "  请选择："
+        echo "    1) 进入管理菜单"
+        echo "    2) 重新配置"
+        echo -n "  [1]: "
+        read -r C
+        if [ "$C" = "2" ]; then
+            first_setup
+        else
+            main_menu
+        fi
+    else
+        echo -e "${GREEN}检测到安装方式: $METHOD${NC}"
+        main_menu
+    fi
 fi

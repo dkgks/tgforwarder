@@ -1,6 +1,6 @@
 # tgforwarder — Telegram 消息转发机器人
 
-自动将陌生人的消息转发到你的 Telegram，支持 AI 智能过滤广告/脏话、关键词屏蔽、分级处罚、Docker 一键部署。
+自动将陌生人的消息转发到你的 Telegram，支持 AI 智能过滤广告/脏话、关键词屏蔽、分级处罚。
 
 ## 功能
 
@@ -12,45 +12,24 @@
 - ⚙️ 全功能管理面板（Inline 按钮）
 - 🕐 时区自动检测
 - 🔄 一键 GitHub Release 在线升级
-- 🐳 Docker 一键部署
+- 🔧 多机器人管理（一个脚本管理多个 bot 实例）
 
 ## 快速开始
 
-### 🐳 Docker 一键部署（推荐）
+### 一键部署（推荐）
 
 ```bash
-bash <(curl -sSL https://raw.githubusercontent.com/dkgks/tgforwarder/main/setup.sh)
+bash <(curl -sSL https://raw.githubusercontent.com/dkgks/tgforwarder/main/tgfwd.sh)
 ```
 
-脚本会引导输入 Bot Token 和用户 ID，自动完成克隆、配置、Docker 启动。
+首次运行会引导选择安装方式：
+- **系统服务**（推荐）— systemd 开机自启，崩溃自动重启
+- **Docker** — 需要已安装 Docker + docker compose
+- **后台进程** — 简单快速，启动即用
 
-### 🖥️ Linux 一键部署（非 Docker）
+已安装的用户再次运行 `bash tgfwd.sh` 会自动进入管理菜单。
 
-```bash
-bash <(curl -sSL https://raw.githubusercontent.com/dkgks/tgforwarder/main/install.sh)
-```
-
-无需 Docker，直接安装 Python 依赖并启动。推荐再用 `bash tgfwd.sh` 选 1 安装为系统服务。
-
-### Docker 手动部署
-
-```bash
-# 1. 克隆仓库
-git clone https://github.com/dkgks/tgforwarder.git
-cd tgforwarder
-
-# 2. 准备配置
-cp config.example.json data/config.json
-# 编辑 data/config.json，填入 bot_token 和 owner_id
-
-# 3. 启动
-docker compose up -d
-
-# 4. 查看日志
-docker compose logs -f
-```
-
-### Linux 手动部署（非 Docker）
+### 手动部署
 
 ```bash
 # 1. 克隆仓库
@@ -60,38 +39,28 @@ cd tgforwarder
 # 2. 安装 Python 依赖
 pip install python-telegram-bot[job-queue] httpx
 
-# 3. 创建配置
-cp config.example.json config.json
-# 编辑 config.json，填入 bot_token 和 owner_id
-# 可选：填入 ai.api_key 启用 AI 智能分类
-
-# 4. 测试运行
-python3 forwarder.py
-# 确认日志显示 "Forwarder running!" 后 Ctrl+C 停止
-
-# 5. 安装为系统服务（可选，推荐用于长期运行）
+# 3. 启动管理脚本
 bash tgfwd.sh
-# 选 1 启动 → 自动创建 systemd 服务，开机自启 + 崩溃自动重启
 ```
 
-**非 Docker 管理命令：**
+### 管理命令
 
-| 操作 | 命令 |
+| 操作 | 方式 |
 |---|---|
-| 管理面板 | `bash tgfwd.sh` |
-| 启动 | `bash tgfwd.sh` → 选 1 |
-| 停止 | `bash tgfwd.sh` → 选 2 |
-| 重启 | `bash tgfwd.sh` → 选 3 |
-| 查看日志 | `bash tgfwd.sh` → 选 5 |
-| 一键升级 | `bash tgfwd.sh` → 选 8 |
-| 直接启动 | `python3 forwarder.py` |
-| 直接停止 | `systemctl --user stop tg-forwarder` |
+| 管理面板入口 | `bash tgfwd.sh` |
+| 添加机器人 | 菜单 → 添加新机器人 |
+| 删除机器人 | 菜单 → 删除机器人 |
+| 修改 AI 配置 | 菜单 → 修改 AI 配置 |
+| 开关功能 | 菜单 → 开关功能 |
+| 更新程序 | 菜单 → 更新程序 (git pull) |
+| 在线升级 | Telegram 面板 → 🔄 检查更新 |
 
-**依赖要求：**
+### 依赖要求
 
 - Python 3.9+
 - 操作系统：Linux（推荐 Debian/Ubuntu）
 - systemd（用于服务管理，可选）
+- Docker + docker compose（仅 Docker 部署需要）
 
 ### 创建 Bot Token
 
@@ -137,13 +106,8 @@ bash tgfwd.sh
 ### 管理面板升级
 在管理面板点「🔄 检查更新」→「升级到最新版」，自动下载 GitHub Release 并替换代码文件，备份旧版本，失败自动回滚。
 
-### 脚本升级（非 Docker 部署）
-已部署的用户可直接用 `tgfwd.sh` 管理：
-
-```bash
-bash tgfwd.sh
-# 选 1=启动 2=停止 3=重启 4=状态 5=查看日志 6=查看用户 7=查看统计 8=一键升级
-```
+### 脚本升级
+已部署的用户可直接用 `tgfwd.sh` 管理菜单中的「更新程序」选项。
 
 ## 许可证
 
