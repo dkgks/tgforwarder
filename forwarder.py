@@ -279,12 +279,30 @@ def load_keywords():
         with open(KEYWORDS_FILE) as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        # Auto-copy from example on first run
+        # Auto-copy from example on first run.
+        # Look in instance dir first, then fall back to project root.
         example_file = os.path.join(INSTANCE_DIR, "keywords.example.json")
+        if not os.path.exists(example_file):
+            project_root = os.path.dirname(os.path.abspath(__file__))
+            fallback = os.path.join(project_root, "keywords.example.json")
+            if os.path.exists(fallback):
+                example_file = fallback
         if os.path.exists(example_file):
             import shutil
             shutil.copy(example_file, KEYWORDS_FILE)
-            logger.info("First run: copied keywords.example.json → keywords.json")
+            logger.info("First run: copied %s → keywords.json", example_file)
+            try:
+                with open(KEYWORDS_FILE) as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        # Also try project root keywords.json as fallback
+        project_root = os.path.dirname(os.path.abspath(__file__))
+        root_kw = os.path.join(project_root, "keywords.json")
+        if os.path.exists(root_kw):
+            import shutil
+            shutil.copy(root_kw, KEYWORDS_FILE)
+            logger.info("First run: copied %s → keywords.json", root_kw)
             try:
                 with open(KEYWORDS_FILE) as f:
                     return json.load(f)
@@ -653,6 +671,7 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
         checked = us.get("msgs_checked", 0) + 1
         old_abuse = us.get("abuse_count", 0)
         update_kw = {"msgs_checked": checked, "spam_count": spam_c,
+                     "abuse_count": 0,  # reset on normal message (consecutive-only)
                      "last_active": now, "last_msg_time": now}
         fwd_id = await forward_to_owner(user.id, user.full_name, user.username, text,
                                         spam_c, old_abuse)
@@ -723,7 +742,8 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # === 5. OK → forward ===
     old_abuse = us.get("abuse_count", 0)
-    update_kw = {"spam_count": spam_c, "last_active": now, "last_msg_time": now}
+    update_kw = {"spam_count": spam_c, "abuse_count": 0,  # reset on normal message (consecutive-only)
+                 "last_active": now, "last_msg_time": now}
     if checked >= 10:
         update_kw["approved"] = True
         update_kw["msgs_checked"] = checked

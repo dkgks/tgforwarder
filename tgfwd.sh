@@ -219,6 +219,16 @@ for i, (pid, ctx) in enumerate(free[:25], 1):
 }
 EOF
 
+    # 复制关键词文件到实例目录
+    if [ -f "$INSTALL_DIR/keywords.json" ]; then
+        cp "$INSTALL_DIR/keywords.json" "$INSTANCE_PATH/keywords.json"
+        echo "  ✅ 已复制 keywords.json"
+    fi
+    if [ -f "$INSTALL_DIR/keywords.example.json" ]; then
+        cp "$INSTALL_DIR/keywords.example.json" "$INSTANCE_PATH/keywords.example.json"
+        echo "  ✅ 已复制 keywords.example.json"
+    fi
+
     echo -e "${GREEN}✅ 机器人已配置: $INSTANCE_NAME${NC}"
     echo "  配置文件: $CONFIG_FILE"
 
