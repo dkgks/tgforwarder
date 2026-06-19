@@ -14,7 +14,7 @@ Features:
 - Blocked user management, auto-reply, keyword management
 """
 
-__version__ = "1.7.4"
+__version__ = "1.7.5"
 
 import asyncio, json, logging, os, signal, sys, time
 import httpx
@@ -1453,6 +1453,7 @@ def build_user_detail(uid: int):
         InlineKeyboardButton("🗑 删除用户", callback_data=f"delete_confirm_{uid}"),
         InlineKeyboardButton("📝 屏蔽记录", callback_data=f"abuse_history_{uid}"),
     ])
+    rows.append([InlineKeyboardButton("👤 查看资料", url=f"tg://user?id={uid}")])
     rows.append([InlineKeyboardButton("↩ 返回用户列表", callback_data="users_p0")])
 
     text = "\n".join(lines)
