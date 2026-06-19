@@ -415,12 +415,10 @@ async def sync_cloud_keywords() -> str:
         return f"❌ 下载云端词库失败：{e}"
 
     local = load_keywords()
-    old_preset = local.get("_preset", {"abuse": [], "spam": []})
-    new_preset = {
-        "abuse": sorted(set(cloud_kw.get("abuse", [])) | set(old_preset.get("abuse", []))),
-        "spam": sorted(set(cloud_kw.get("spam", [])) | set(old_preset.get("spam", []))),
+    local["_preset"] = {
+        "abuse": sorted(cloud_kw.get("abuse", [])),
+        "spam": sorted(cloud_kw.get("spam", [])),
     }
-    local["_preset"] = new_preset
     refresh_kw_runtime(local)
     save_keywords(local)
     refresh_kw_sets()
