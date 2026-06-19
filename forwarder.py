@@ -14,7 +14,7 @@ Features:
 - Blocked user management, auto-reply, keyword management
 """
 
-__version__ = "1.7.5"
+__version__ = "1.7.6"
 
 import asyncio, json, logging, os, signal, sys, time
 import httpx
@@ -2044,6 +2044,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "to_version": tag.lstrip("v"),
                     "backup_dir": f"backup/v{__version__}",
                     "created_at": datetime_iso(),
+                    "panel_msg_id": msg_id,
                 }, ff)
 
             # Step 6: Final
@@ -2512,7 +2513,7 @@ async def rollback_watchdog():
                     if back_dir and os.path.isdir(back_dir):
                         _shutil.rmtree(back_dir)
                         logger.info(f"Upgrade watchdog: cleaned up {back_dir}")
-                # Notify owner
+                # Notify owner first
                 msg = (
                     f"✅ **升级成功！**\n\n"
                     f"当前版本：v{to_ver}\n"
@@ -2526,6 +2527,17 @@ async def rollback_watchdog():
                         )
                 except Exception:
                     pass
+                # Delete upgrade panel message
+                panel_msg_id = flag_data.get("panel_msg_id")
+                if panel_msg_id:
+                    try:
+                        async with httpx.AsyncClient(timeout=10) as nc:
+                            await nc.post(
+                                f"https://api.telegram.org/bot{NEW_BOT_TOKEN}/deleteMessage",
+                                json={"chat_id": OWNER_ID, "message_id": panel_msg_id}
+                            )
+                    except Exception:
+                        pass
                 return
             else:
                 raise Exception(f"getMe failed: HTTP {r.status_code}")
