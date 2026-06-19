@@ -14,7 +14,7 @@ Features:
 - Blocked user management, auto-reply, keyword management
 """
 
-__version__ = "1.7.6"
+__version__ = "1.7.7"
 
 import asyncio, json, logging, os, signal, sys, time
 import httpx
@@ -274,10 +274,37 @@ def _load_reply_map():
         logger.warning(f"Failed to load reply_map: {e}")
 
 # === Keyword management (dynamic, persisted) ===
+# Data structure (v2):
+#   _preset:       {abuse:[], spam:[]}  — cloud preset, never modified by user
+#   _user_added:   {abuse:[], spam:[]}  — user manually added
+#   _user_removed: {abuse:[], spam:[]}  — user manually removed from preset
+#   abuse/spam:    runtime merged = _preset + _user_added - _user_removed
+# When loading old-format keywords.json, migrate to new format.
+
+def _migrate_keywords(kw: dict) -> dict:
+    """Migrate old-format keywords to v2 with _preset/_user_added/_user_removed."""
+    new_kw = {
+        "_preset": {"abuse": list(kw.get("abuse", [])), "spam": list(kw.get("spam", []))},
+        "_user_added": {"abuse": [], "spam": []},
+        "_user_removed": {"abuse": [], "spam": []},
+        "abuse": [],
+        "spam": [],
+    }
+    logger.info("Keywords: migrated to v2 format")
+    return new_kw
+
 def load_keywords():
     try:
         with open(KEYWORDS_FILE) as f:
-            return json.load(f)
+            kw = json.load(f)
+            # Check if v2 format
+            if "_preset" in kw:
+                return kw
+            # Old format: migrate
+            kw = _migrate_keywords(kw)
+            refresh_kw_runtime(kw)
+            save_keywords(kw)
+            return kw
     except (FileNotFoundError, json.JSONDecodeError):
         # Auto-copy from example on first run.
         # Look in instance dir first, then fall back to project root.
@@ -293,7 +320,10 @@ def load_keywords():
             logger.info("First run: copied %s → keywords.json", example_file)
             try:
                 with open(KEYWORDS_FILE) as f:
-                    return json.load(f)
+                    kw = json.load(f)
+                    if "_preset" in kw:
+                        return kw
+                    return _migrate_keywords(kw)
             except Exception:
                 pass
         # Also try project root keywords.json as fallback
@@ -305,10 +335,19 @@ def load_keywords():
             logger.info("First run: copied %s → keywords.json", root_kw)
             try:
                 with open(KEYWORDS_FILE) as f:
-                    return json.load(f)
+                    kw = json.load(f)
+                    if "_preset" in kw:
+                        return kw
+                    return _migrate_keywords(kw)
             except Exception:
                 pass
-        return {"abuse": [], "spam": []}
+        return {
+            "_preset": {"abuse": [], "spam": []},
+            "_user_added": {"abuse": [], "spam": []},
+            "_user_removed": {"abuse": [], "spam": []},
+            "abuse": [],
+            "spam": [],
+        }
 
 def save_keywords(kw):
     with open(KEYWORDS_FILE + ".tmp", "w") as f:
@@ -319,19 +358,77 @@ def save_keywords(kw):
         import shutil
         shutil.move(KEYWORDS_FILE + ".tmp", KEYWORDS_FILE)
 
+def refresh_kw_runtime(kw):
+    """Compute runtime lists from _preset + _user_added - _user_removed."""
+    for kind in ("abuse", "spam"):
+        preset = kw.get("_preset", {}).get(kind, [])
+        added = kw.get("_user_added", {}).get(kind, [])
+        removed = set(kw.get("_user_removed", {}).get(kind, []))
+        merged = list(preset) + [w for w in added if w not in preset]
+        kw[kind] = [w for w in merged if w not in removed]
+
 def add_keyword(kind: str, word: str):
     kw = load_keywords()
-    if word not in kw[kind]:
-        kw[kind].append(word)
-        save_keywords(kw)
-        refresh_kw_sets()
+    removed = kw.get("_user_removed", {}).get(kind, [])
+    if word in removed:
+        removed.remove(word)
+        logger.info(f"Keyword: remove '{word}' from _user_removed list")
+    already_preset = word in kw.get("_preset", {}).get(kind, [])
+    if not already_preset:
+        user_added = kw.get("_user_added", {}).get(kind, [])
+        if word not in user_added:
+            user_added.append(word)
+            logger.info(f"Keyword: added '{word}' to _user_added")
+    refresh_kw_runtime(kw)
+    save_keywords(kw)
+    refresh_kw_sets()
 
 def remove_keyword(kind: str, word: str):
     kw = load_keywords()
-    if word in kw[kind]:
-        kw[kind].remove(word)
-        save_keywords(kw)
-        refresh_kw_sets()
+    preset = kw.get("_preset", {}).get(kind, [])
+    user_added = kw.get("_user_added", {}).get(kind, [])
+    user_removed = kw.get("_user_removed", {})
+    if word in preset:
+        if word not in user_removed.get(kind, []):
+            user_removed.setdefault(kind, []).append(word)
+            logger.info(f"Keyword: removed preset '{word}' → _user_removed")
+    if word in user_added:
+        user_added.remove(word)
+        logger.info(f"Keyword: removed user-added '{word}'")
+    refresh_kw_runtime(kw)
+    save_keywords(kw)
+    refresh_kw_sets()
+
+async def sync_cloud_keywords() -> str:
+    """Download latest keywords.example.json from GitHub, merge with local data.
+    
+    Preserves user_added and user_removed lists. Only _preset is updated.
+    """
+    url = "https://raw.githubusercontent.com/dkgks/tgforwarder/main/keywords.example.json"
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            r = await client.get(url)
+            if r.status_code != 200:
+                return f"❌ 下载云端词库失败 HTTP {r.status_code}"
+            cloud_kw = r.json()
+    except Exception as e:
+        return f"❌ 下载云端词库失败：{e}"
+
+    local = load_keywords()
+    old_preset = local.get("_preset", {"abuse": [], "spam": []})
+    new_preset = {
+        "abuse": sorted(set(cloud_kw.get("abuse", [])) | set(old_preset.get("abuse", []))),
+        "spam": sorted(set(cloud_kw.get("spam", [])) | set(old_preset.get("spam", []))),
+    }
+    local["_preset"] = new_preset
+    refresh_kw_runtime(local)
+    save_keywords(local)
+    refresh_kw_sets()
+
+    na = len(local.get("abuse", []))
+    ns = len(local.get("spam", []))
+    logger.info(f"Cloud keyword sync OK: {na} abuse, {ns} spam")
+    return f"✅ 云端词库同步完成！\n😠 脏话 {na} 词 | 📋 广告 {ns} 词"
 
 ABUSE_KW: set = set()
 SPAM_KW: set = set()
@@ -346,6 +443,11 @@ _stop_event: asyncio.Event | None = None
 
 def refresh_kw_sets():
     kw = load_keywords()
+    if "_preset" not in kw:
+        kw = _migrate_keywords(kw)
+        refresh_kw_runtime(kw)
+        save_keywords(kw)
+        kw = load_keywords()
     ABUSE_KW.clear()
     ABUSE_KW.update(kw.get("abuse", []))
     SPAM_KW.clear()
@@ -1315,6 +1417,7 @@ def build_kw_menu():
          InlineKeyboardButton(f"📋 查看广告词 ({ns})", callback_data="kw_view_spam_0")],
         [InlineKeyboardButton("➕ 添加屏蔽词", callback_data="kw_add_pick")],
         [InlineKeyboardButton("➖ 删除屏蔽词", callback_data="kw_del_pick")],
+        [InlineKeyboardButton("🔄 同步云端词库", callback_data="kw_sync_cloud")],
         [InlineKeyboardButton("↩ 返回菜单", callback_data="menu")],
     ])
     return text, markup
@@ -1323,6 +1426,8 @@ def build_kw_menu():
 def build_kw_view(kind: str, page: int):
     """Paginated view of keywords."""
     kw = load_keywords()
+    preset = set(kw.get("_preset", {}).get(kind, []))
+    added = set(kw.get("_user_added", {}).get(kind, []))
     words = kw.get(kind, [])
     label = "脏话" if kind == "abuse" else "广告"
     emoji = "😠" if kind == "abuse" else "📋"
@@ -1341,7 +1446,8 @@ def build_kw_view(kind: str, page: int):
 
     lines = [f"{emoji} **{label}屏蔽词** ({len(words)}个) 第{page+1}/{total_pages}页\n"]
     for i, w in enumerate(words[start:end], start + 1):
-        lines.append(f"{i}. `{w}`")
+        tag = "[预设]" if w in preset else "[自定义]"
+        lines.append(f"{i}. {tag} `{w}`")
 
     rows = []
     nav = []
@@ -1359,6 +1465,7 @@ def build_kw_view(kind: str, page: int):
 def build_kw_del_view(kind: str, page: int):
     """Paginated view with delete buttons per keyword."""
     kw = load_keywords()
+    preset = set(kw.get("_preset", {}).get(kind, []))
     words = kw.get(kind, [])
     label = "脏话" if kind == "abuse" else "广告"
     emoji = "😠" if kind == "abuse" else "📋"
@@ -1379,8 +1486,9 @@ def build_kw_del_view(kind: str, page: int):
 
     rows = []
     for i, w in enumerate(words[start:end], start + 1):
+        tag = "[预设]" if w in preset else "[自定义]"
         rows.append([
-            InlineKeyboardButton(f"{i}. {w}", callback_data="kw_noop"),
+            InlineKeyboardButton(f"{i}. {tag} {w}", callback_data="kw_noop"),
             InlineKeyboardButton("❌", callback_data=f"kw_del_{kind}_{w}"),
         ])
 
@@ -2217,6 +2325,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- Keyword management ---
     if data == "kw_menu":
         content, markup = build_kw_menu()
+        await edit(content, markup)
+        return
+
+    if data == "kw_sync_cloud":
+        await edit("🔄 正在同步云端词库...", InlineKeyboardMarkup([]))
+        result_text = await sync_cloud_keywords()
+        content, markup = build_kw_menu()
+        # Append sync result
+        content = f"{result_text}\n\n{content}"
         await edit(content, markup)
         return
 
