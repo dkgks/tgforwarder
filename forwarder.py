@@ -14,7 +14,7 @@ Features:
 - Blocked user management, auto-reply, keyword management
 """
 
-__version__ = "1.7.7"
+__version__ = "1.8.0"
 
 import asyncio, json, logging, os, signal, sys, time
 import httpx
@@ -611,13 +611,16 @@ async def check_ai_token() -> str:
     return "unchecked"
 
 
-async def send_msg(chat_id: int, text: str) -> bool:
-    """Send a message via the new bot."""
+async def send_msg(chat_id: int, text: str, reply_to_message_id: int = 0) -> bool:
+    """Send a message via the new bot. Optional reply_to_message_id for direct reply."""
     try:
         async with httpx.AsyncClient(timeout=15) as c:
+            payload: dict = {"chat_id": chat_id, "text": text}
+            if reply_to_message_id:
+                payload["reply_to_message_id"] = reply_to_message_id
             r = await c.post(
                 f"https://api.telegram.org/bot{NEW_BOT_TOKEN}/sendMessage",
-                json={"chat_id": chat_id, "text": text}
+                json=payload
             )
             return r.status_code == 200 and r.json().get("ok")
     except Exception as e:
@@ -693,6 +696,257 @@ async def tag_forwarded_message(fwd_msg_id: int, tag: str, original_text: str = 
         logger.error(f"tag_forwarded_message error: {e}")
 
 
+# ============================================================
+# Batch delay queue for unapproved users (5s window)
+# uid → {"messages": [{"text":str, "local":str, "matched":list, "msg_id":int,
+#                      "full_name":str, "username":str}, ...],
+#         "timer_task": asyncio.Task}
+_pending_queues: dict[int, dict] = {}
+BATCH_WINDOW_SEC = 5
+
+
+async def ai_classify_batch(messages: list[dict]) -> tuple[dict[int, str], str]:
+    """Batch AI classify: returns ({index: label}, overall_label).
+    
+    Sends all messages together for context-aware per-message + overall judgement.
+    """
+    if not messages:
+        return ({}, "OK")
+
+    # Build prompt with numbered messages
+    msgs_text = "\n".join(f"[消息{i+1}] {m['text'][:500]}" for i, m in enumerate(messages))
+    prompt = f"""判断以下多组消息的类别，从两个角度分析：
+
+1. 逐条分析每条消息是否包含广告/辱骂：
+   ABUSE = 辱骂/脏话/人身攻击
+   SPAM = 广告/推广/拉群/可疑链接
+   OK = 正常消息
+
+2. 整体分析：这几条消息合在一起，是否构成明显的广告行为？
+   即使每条单独看起来正常，但组合在一起明显是广告/推广的，也要判定为 SPAM。
+
+{msgs_text}
+
+请严格按以下格式回复（每条一行，共两行）：
+1:SPAM, 2:OK, 3:SPAM
+OVERALL:SPAM"""
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.post(
+                f"{AI_BASE_URL}/chat/completions",
+                headers={"Authorization": f"Bearer {AI_API_KEY}"},
+                json={
+                    "model": CLASSIFY_MODEL,
+                    "messages": [
+                        {"role": "system", "content": "你是一个消息分类器。必须严格按照要求的格式回复。"},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "max_tokens": 200,
+                    "temperature": 0
+                }
+            )
+            if r.status_code == 200:
+                ans = r.json()["choices"][0]["message"]["content"].strip()
+                return _parse_batch_result(ans, len(messages))
+            elif r.status_code in (401, 403):
+                logger.error(f"AI batch classify token invalid (HTTP {r.status_code}), disabling AI")
+                await _disable_ai_due_to_auth()
+    except Exception as e:
+        logger.error(f"AI batch classify error: {e}")
+    return ({}, "OK")
+
+
+def _parse_batch_result(answer: str, count: int) -> tuple[dict[int, str], str]:
+    """Parse AI batch response into {index: label} and overall. Robust to formatting noise."""
+    labels: dict[int, str] = {}
+    overall = "OK"
+    lines = answer.strip().split("\n")
+    for line in lines:
+        line = line.strip().upper()
+        if line.startswith("OVERALL"):
+            if "SPAM" in line:
+                overall = "SPAM"
+            # OK is default
+        else:
+            # Try to parse "1:SPAM" pattern
+            parts = line.split(",")
+            for part in parts:
+                part = part.strip()
+                if ":" in part:
+                    idx_str, lbl = part.split(":", 1)
+                    try:
+                        idx = int(idx_str.strip())
+                        lbl = lbl.strip()
+                        for valid in ["SPAM", "ABUSE", "OK"]:
+                            if valid in lbl:
+                                labels[idx - 1] = valid  # convert to 0-based
+                                break
+                    except ValueError:
+                        pass
+    # Fill missing with OK
+    for i in range(count):
+        labels.setdefault(i, "OK")
+    return (labels, overall)
+
+
+async def _flush_pending_queue(uid: int):
+    """Process a user's pending message batch after the 5s window expires."""
+    entry = _pending_queues.pop(uid, None)
+    if not entry or not entry.get("messages"):
+        return
+
+    msgs = entry["messages"]
+    us = await state.ensure_user(uid, "", "")
+    spam_c = us.get("spam_count", 0)
+    now = datetime_iso()
+
+    logger.info(f"Batch flush for user {uid}: {len(msgs)} messages")
+
+    # Count local keyword hits
+    local_spam_abuse = [(i, m) for i, m in enumerate(msgs) if m["local"] in ("SPAM", "ABUSE")]
+    local_hit_count = len(local_spam_abuse)
+
+    if local_hit_count >= 2:
+        # === Local ≥2: block entire batch, no AI ===
+        logger.info(f"Batch for user {uid}: {local_hit_count} local hits → block all")
+        for _, m in local_spam_abuse:
+            await record_blocked_content(uid, m["text"], m["local"].lower(), m.get("matched"))
+        spam_c += local_hit_count
+        stats_add("ads_blocked", local_hit_count)
+        update_kw = {"spam_count": spam_c, "blocked": True,
+                     "last_active": now, "last_msg_time": now, "msgs_checked": 0}
+        await send_msg(uid, "滚吧，广告狗，你已被拉黑。")
+        await state.update(uid, **update_kw)
+        logger.info(f"Batch for user {uid}: blocked (local ≥2), spam_count={spam_c}")
+        return
+
+    # Need AI for remaining messages (only classify MAYBE/OK ones)
+    ai_hit_count = 0
+    ai_labels: dict[int, str] = {}
+    overall = "OK"
+    to_classify = [m for m in msgs if m["local"] in ("MAYBE", "OK")]
+
+    if AI_ENABLED and to_classify:
+        batch_labels, overall = await ai_classify_batch(to_classify)
+        # Map batch indices back to original message indices
+        for bi, label in batch_labels.items():
+            if label in ("SPAM", "ABUSE"):
+                # Find the original index of the bi-th message in to_classify
+                if bi < len(to_classify):
+                    tc_msg = to_classify[bi]
+                    # Find this message in msgs
+                    for oi, om in enumerate(msgs):
+                        if om is tc_msg:
+                            ai_labels[oi] = label
+                            break
+                    ai_hit_count += 1
+
+    total_hits = local_hit_count + ai_hit_count
+
+    if overall == "SPAM" or total_hits >= 2:
+        # === Block entire batch ===
+        logger.info(f"Batch for user {uid}: overall={overall}, total_hits={total_hits} → block all")
+        for _, m in local_spam_abuse:
+            await record_blocked_content(uid, m["text"], m["local"].lower(), m.get("matched"))
+        for oi, label in ai_labels.items():
+            await record_blocked_content(uid, msgs[oi]["text"], label.lower(), ["AI"])
+        spam_c += total_hits
+        stats_add("ads_blocked", total_hits)
+        update_kw = {"spam_count": spam_c, "blocked": True,
+                     "last_active": now, "last_msg_time": now, "msgs_checked": 0}
+        await send_msg(uid, "滚吧，广告狗，你已被拉黑。")
+        await state.update(uid, **update_kw)
+        logger.info(f"Batch for user {uid}: blocked (AI), spam_count={spam_c}")
+        return
+
+    if total_hits == 1:
+        # === Single hit: block that one, forward the rest ===
+        hit_idx = None
+        if local_spam_abuse:
+            hit_idx = local_spam_abuse[0][0]
+        elif ai_labels:
+            hit_idx = next(iter(ai_labels))
+
+        spam_c += 1
+        stats_add("ads_blocked")
+
+        last_fwd_id = 0
+        forwarded_count = 0
+        for i, m in enumerate(msgs):
+            if i == hit_idx:
+                # Reply to the spam message
+                await record_blocked_content(uid, m["text"],
+                    (local_spam_abuse[0][1]["local"] if local_spam_abuse else ai_labels[hit_idx]).lower(),
+                    m.get("matched") or ["AI"])
+                await send_msg(uid, "请勿发送广告。", reply_to_message_id=m["msg_id"])
+            else:
+                fwd_id = await forward_to_owner(uid, m.get("full_name", ""), m.get("username", ""),
+                                                m["text"], spam_c, 0)
+                if fwd_id:
+                    last_fwd_id = fwd_id
+                forwarded_count += 1
+                logger.info(f"Batch for user {uid}: msg[{i}] OK → forwarded")
+
+        checked = us.get("msgs_checked", 0) + forwarded_count
+        update_kw = {"msgs_checked": checked, "spam_count": spam_c,
+                     "last_active": now, "last_msg_time": now}
+        if last_fwd_id:
+            update_kw["has_forwarded"] = True
+            update_kw["last_fwd_msg_id"] = last_fwd_id
+        await state.update(uid, **update_kw)
+        logger.info(f"Batch for user {uid}: 1 hit → blocked that one, forwarded {forwarded_count}, spam_count={spam_c}")
+        return
+
+    # === 0 hits: forward all ===
+    logger.info(f"Batch for user {uid}: 0 hits → forward all")
+    checked = us.get("msgs_checked", 0) + len(msgs)
+    update_kw = {"msgs_checked": checked, "spam_count": spam_c, "abuse_count": 0,
+                 "last_active": now, "last_msg_time": now}
+    if checked >= 10:
+        update_kw["approved"] = True
+        logger.info(f"User {uid} APPROVED (continuous {checked} OK)")
+
+    last_fwd_id = 0
+    for m in msgs:
+        fwd_id = await forward_to_owner(uid, m.get("full_name", ""), m.get("username", ""),
+                                        m["text"], spam_c, 0)
+        if fwd_id:
+            last_fwd_id = fwd_id
+        logger.info(f"Batch for user {uid}: msg → forwarded")
+
+    if last_fwd_id:
+        update_kw["has_forwarded"] = True
+        update_kw["last_fwd_msg_id"] = last_fwd_id
+
+    auto_cfg = load_auto_reply()
+    if auto_cfg.get("enabled"):
+        max_cnt = auto_cfg.get("max_count", 1)
+        used = us.get("auto_reply_used", 0)
+        if used < max_cnt:
+            await send_msg(uid, auto_cfg["text"])
+            update_kw["auto_reply_used"] = used + 1
+    await state.update(uid, **update_kw)
+
+
+async def _cancel_pending_timer(uid: int):
+    """Cancel a user's pending batch timer if exists."""
+    entry = _pending_queues.get(uid)
+    if entry and entry.get("timer_task") and not entry["timer_task"].done():
+        entry["timer_task"].cancel()
+
+
+async def _schedule_batch_flush(uid: int, delay: float = BATCH_WINDOW_SEC):
+    """Schedule (or reschedule) a timer to flush the pending queue for a user."""
+    await _cancel_pending_timer(uid)
+    async def _timer():
+        await asyncio.sleep(delay)
+        await _flush_pending_queue(uid)
+    task = asyncio.create_task(_timer())
+    if uid in _pending_queues:
+        _pending_queues[uid]["timer_task"] = task
+
+
 async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg or not msg.text:
@@ -740,7 +994,7 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 insult = "请文明用语，再有一次将被拉黑。"
         else:
             insult = "请文明用语，此条消息不会转发给管理员。"
-        await send_msg(user.id, insult)
+        await send_msg(user.id, insult, reply_to_message_id=msg.message_id)
         await state.update(user.id, **update_kw)
         logger.info(f"ABUSE from {user.id} (local hit, abuse #{abuse_c}) → replied")
         return
@@ -754,14 +1008,14 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
                      "last_active": now, "last_msg_time": now}
         if spam_c == 1:
             stats_add("ads_blocked")
-            await send_msg(user.id, "请勿发送广告。")
+            await send_msg(user.id, "请勿发送广告。", reply_to_message_id=msg.message_id)
         elif spam_c == 2:
             stats_add("ads_blocked")
-            await send_msg(user.id, "请注意言辞，再发广告将被拉黑。")
+            await send_msg(user.id, "请注意言辞，再发广告将被拉黑。", reply_to_message_id=msg.message_id)
         else:
             stats_add("ads_blocked")
             update_kw["blocked"] = True
-            await send_msg(user.id, "你已被拉黑，滚吧。")
+            await send_msg(user.id, "你已被拉黑，滚吧。", reply_to_message_id=msg.message_id)
         await state.update(user.id, **update_kw)
         logger.info(f"SPAM from {user.id} (local hit, spam #{spam_c}) → auto-replied")
         return
@@ -789,82 +1043,25 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await state.update(user.id, **update_kw)
         return
 
-    # === 4. Not approved → AI classify ===
-    checked_us = us.get("msgs_checked", 0)
-    if AI_ENABLED:
-        label = await ai_classify(text)
-    else:
-        label = "OK"
-    checked = checked_us + 1
-    logger.info(f"User {user.id} msg#{checked} → {label}: {text[:100]}")
+    # === 4. Not approved → enter batch queue ===
+    local_label, matched = local_check(text)
+    msg_entry = {
+        "text": text,
+        "local": local_label,
+        "matched": matched,
+        "msg_id": msg.message_id,
+        "full_name": user.full_name or "",
+        "username": user.username or "",
+        "arrived_at": datetime_iso(),
+    }
 
-    if "ABUSE" in label:
-        await record_blocked_content(user.id, text, "abuse", ["AI"])
-        abuse_c = us.get("abuse_count", 0) + 1
-        checked = 0
-        update_kw = {"msgs_checked": checked, "spam_count": spam_c, "abuse_count": abuse_c,
-                     "last_active": now, "last_msg_time": now}
-        if abuse_c >= 2:
-            if AI_ENABLED:
-                insult = await ai_generate_insult(text)
-                stats_add("abuse_replies")
-                update_kw["ai_insult_count"] = us.get("ai_insult_count", 0) + 1
-                if us.get("has_forwarded") and us.get("last_fwd_msg_id"):
-                    await tag_forwarded_message(us["last_fwd_msg_id"], "⚠️ 已启动AI自动回骂")
-            else:
-                insult = "请文明用语，再有一次将被拉黑。"
-        else:
-            insult = "请文明用语，此条消息不会转发给管理员。"
-        await send_msg(user.id, insult)
-        await state.update(user.id, **update_kw)
-        logger.info(f"ABUSE from {user.id} (AI, abuse #{abuse_c}) → replied")
-        return
+    if user.id not in _pending_queues:
+        _pending_queues[user.id] = {"messages": [], "timer_task": None}
+    _pending_queues[user.id]["messages"].append(msg_entry)
 
-    if label == "SPAM":
-        await record_blocked_content(user.id, text, "spam", ["AI"])
-        spam_c += 1
-        checked = 0
-        update_kw = {"msgs_checked": checked, "spam_count": spam_c,
-                     "last_active": now, "last_msg_time": now}
-        if spam_c == 1:
-            stats_add("ads_blocked")
-            await send_msg(user.id, "请勿发送广告。")
-        elif spam_c == 2:
-            stats_add("ads_blocked")
-            await send_msg(user.id, "请注意言辞，再发广告将被拉黑。")
-        else:
-            stats_add("ads_blocked")
-            update_kw["blocked"] = True
-            await send_msg(user.id, "你已被拉黑，滚吧。")
-        await state.update(user.id, **update_kw)
-        logger.info(f"SPAM from {user.id} (AI, spam #{spam_c}) → auto-replied")
-        return
-
-    # === 5. OK → forward ===
-    old_abuse = us.get("abuse_count", 0)
-    update_kw = {"spam_count": spam_c, "abuse_count": 0,  # reset on normal message (consecutive-only)
-                 "last_active": now, "last_msg_time": now}
-    if checked >= 10:
-        update_kw["approved"] = True
-        update_kw["msgs_checked"] = checked
-        logger.info(f"User {user.id} APPROVED (continuous {checked} OK)")
-    else:
-        update_kw["msgs_checked"] = checked
-    fwd_id = await forward_to_owner(user.id, user.full_name, user.username, text,
-                                    spam_c, old_abuse)
-    if fwd_id:
-        update_kw["has_forwarded"] = True
-        update_kw["last_fwd_msg_id"] = fwd_id
-    logger.info(f"User {user.id} OK → forwarded")
-
-    auto_cfg = load_auto_reply()
-    if auto_cfg.get("enabled"):
-        max_cnt = auto_cfg.get("max_count", 1)
-        used = us.get("auto_reply_used", 0)
-        if used < max_cnt:
-            await send_msg(user.id, auto_cfg["text"])
-            update_kw["auto_reply_used"] = used + 1
-    await state.update(user.id, **update_kw)
+    logger.info(f"User {user.id} unapproved → queued (batch size={len(_pending_queues[user.id]['messages'])}, local={local_label})")
+    await _schedule_batch_flush(user.id)
+    # NOTE: No return here — message will be handled by the timer
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
