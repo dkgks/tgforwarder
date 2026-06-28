@@ -43,6 +43,33 @@ pip install python-telegram-bot[job-queue] httpx
 bash tgfwd.sh
 ```
 
+### Docker 预构建镜像
+
+无需本地构建，直接拉取：
+
+```bash
+# Docker Hub（推荐，全球 CDN，免登录）
+docker pull dkgks/tgforwarder:latest
+
+# GitHub Container Registry
+docker pull ghcr.io/dkgks/tgforwarder:latest
+```
+
+每次 Release 自动推送到两个镜像源，内容一致。Docker Hub 在很多 VPS（甲骨文、搬瓦工等）上拉取更稳定。
+
+拉取后启动：
+
+```bash
+# 准备配置文件
+cp config.example.json data/config.json
+nano data/config.json  # 填入 bot_token 和 owner_id
+
+# 启动
+docker run -d --name tgforwarder --restart unless-stopped \
+  -v $(pwd)/data:/app/data \
+  dkgks/tgforwarder:latest
+```
+
 ### 管理命令
 
 | 操作 | 方式 |
