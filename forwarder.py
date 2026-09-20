@@ -14,12 +14,13 @@ Features:
 - Blocked user management, auto-reply, keyword management
 """
 
-__version__ = "1.9.0"
+__version__ = "1.9.1"
 
 import asyncio, json, logging, os, re, signal, sys, time
 import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from telegram.error import BadRequest, NetworkError, TimedOut
 
 # ============================================================
 # Config loading
@@ -2269,26 +2270,34 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = query.message.chat_id
     msg_id = query.message.message_id
 
-    # Helper to edit current message
+    # Helper to edit current message (retries transient failures)
     async def edit(text, markup=None):
-        try:
-            has_md = any(c in text for c in ('*', '_', '`', '~'))
-            await context.bot.edit_message_text(
-                text, chat_id=chat_id, message_id=msg_id,
-                reply_markup=markup,
-                parse_mode="Markdown" if has_md else None
-            )
-        except Exception as e:
-            logger.error(f"Edit message error: {e}")
-            # Fallback: try without parse_mode
-            try:
-                await context.bot.edit_message_text(
-                    text, chat_id=chat_id, message_id=msg_id,
-                    reply_markup=markup,
-                    parse_mode=None
-                )
-            except Exception as e2:
-                logger.error(f"Edit message fallback error: {e2}")
+        has_md = any(c in text for c in ('*', '_', '`', '~'))
+        # Second pass drops Markdown: recovers from unparseable entity errors
+        for parse_mode in (["Markdown", None] if has_md else [None]):
+            for attempt in range(3):
+                try:
+                    await context.bot.edit_message_text(
+                        text, chat_id=chat_id, message_id=msg_id,
+                        reply_markup=markup,
+                        parse_mode=parse_mode
+                    )
+                    return
+                except BadRequest as e:
+                    if "not modified" in str(e):
+                        return  # screen already shows this exact content: not an error
+                    logger.error(f"Edit message error (parse_mode={parse_mode}): {e}")
+                    break
+                except (TimedOut, NetworkError) as e:
+                    if attempt < 2:
+                        logger.warning(f"Edit message transient error, retrying ({attempt + 2}/3): {e}")
+                        await asyncio.sleep(0.8 * (attempt + 1))
+                        continue
+                    logger.error(f"Edit message failed after 3 attempts: {e}")
+                    break
+                except Exception as e:
+                    logger.error(f"Edit message error: {e}")
+                    break
 
     # --- Menu navigation ---
     if data == "menu":

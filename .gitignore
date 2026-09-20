@@ -32,3 +32,7 @@ backup/
 *.gitbak
 _apply_patches.py
 forwarder_patched.py
+
+# 轮转后的日志（logrotate 产物，勿入库）
+*.log-*
+*.log.*.gz
