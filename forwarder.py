@@ -14,9 +14,9 @@ Features:
 - Blocked user management, auto-reply, keyword management
 """
 
-__version__ = "1.8.0"
+__version__ = "1.9.0"
 
-import asyncio, json, logging, os, signal, sys, time
+import asyncio, json, logging, os, re, signal, sys, time
 import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
@@ -53,6 +53,12 @@ AI_ENABLED = AI_AUTO_ENABLED and not AI_ABUSE_MANUAL_OFF
 AI_API_KEY = ai_cfg.get("api_key", "")
 AI_BASE_URL = cfg.get("ai", {}).get("base_url", "https://api.siliconflow.cn/v1")
 AI_PLATFORM = cfg.get("ai", {}).get("platform", "openrouter")  # siliconflow or openrouter
+
+# Platform -> API base URL (kept in sync when switching platform from the panel)
+PLATFORM_BASE_URLS = {
+    "siliconflow": "https://api.siliconflow.cn/v1",
+    "openrouter": "https://openrouter.ai/api/v1",
+}
 CLASSIFY_MODEL = cfg.get("ai", {}).get("classify_model", "qwen/qwen3-next-80b-a3b-instruct:free")
 INSULT_MODEL = cfg.get("ai", {}).get("insult_model", "google/gemma-4-31b-it:free")
 
@@ -1532,7 +1538,7 @@ def build_ai_settings():
 def build_ai_apikey_panel():
     """API key management panel - shows masked key, allows editing."""
     api_key = cfg.get("ai", {}).get("api_key", "")
-    masked = "***" + api_key[-4:] if len(api_key) > 4 else "（未设置）"
+    masked = "••••" + api_key[-4:] if len(api_key) > 4 else "（未设置）"
     platform = cfg.get("ai", {}).get("platform", "unknown")
     text = (
         "🔑 API 密钥管理\n\n"
@@ -1548,17 +1554,195 @@ def build_ai_apikey_panel():
     return text, markup
 
 
+# ============================================================
+# OpenRouter free-model discovery
+# ============================================================
+OR_MODELS_URL = "https://openrouter.ai/api/v1/models"
+OR_CACHE_TTL = 600  # seconds
+OR_PER_PAGE = 8
+OR_CACHE: dict = {"ts": 0.0, "items": []}
+
+# chat_id -> [(model_id, ctx), ...] snapshot of the list that was rendered
+OR_SNAPSHOT: dict[int, list] = {}
+# chat_id -> model_id chosen, waiting for classify/insult confirmation
+OR_PENDING: dict[int, str] = {}
+
+
+def _md_safe(s: str) -> str:
+    """Escape legacy-Markdown characters so model names never break parse_mode."""
+    for ch in ("_", "*", "`", "[", "]", "~"):
+        s = str(s).replace(ch, "\\" + ch)
+    return s
+
+
+def _fmt_ctx(n: int) -> str:
+    try:
+        n = int(n or 0)
+    except (TypeError, ValueError):
+        return "?"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.0f}M"
+    if n >= 1000:
+        return f"{round(n / 1000)}K"
+    return str(n)
+
+
+def _or_param_size_b(txt: str) -> float:
+    """Best-effort parameter count in billions, parsed from id/name."""
+    vals = [float(x) for x in re.findall(r"(\d+(?:\.\d+)?)\s*b(?![a-z0-9])", txt.lower())]
+    return max(vals) if vals else 0.0
+
+
+def _or_capability_score(m: dict) -> float:
+    """Coarse capability heuristic: context + tool/reasoning support + param size."""
+    ctx = m.get("context_length") or 0
+    if ctx >= 1_000_000:
+        score = 40.0
+    elif ctx >= 512_000:
+        score = 35.0
+    elif ctx >= 256_000:
+        score = 30.0
+    elif ctx >= 128_000:
+        score = 22.0
+    elif ctx >= 64_000:
+        score = 12.0
+    else:
+        score = 5.0
+    sp = m.get("supported_parameters") or []
+    if "tools" in sp:
+        score += 12.0
+    if "reasoning" in sp or m.get("reasoning"):
+        score += 8.0
+    score += min(_or_param_size_b(f"{m.get('id', '')} {m.get('name', '')}"), 200.0) * 0.1
+    low = f"{m.get('id', '')} {m.get('name', '')}".lower()
+    for weak in ("content-safety", "embed", "nano", "tiny", "mini", "small"):
+        if weak in low:
+            score -= 6.0
+    return score
+
+
+async def fetch_openrouter_free_models(force: bool = False):
+    """Return (items, error). items = [{id, ctx, score}] sorted by capability desc."""
+    now = time.time()
+    if not force and OR_CACHE["items"] and (now - OR_CACHE["ts"]) < OR_CACHE_TTL:
+        return OR_CACHE["items"], None
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(OR_MODELS_URL)
+        if r.status_code != 200:
+            return OR_CACHE["items"], f"HTTP {r.status_code}"
+        data = r.json().get("data", [])
+    except Exception as e:
+        logger.error(f"OpenRouter models fetch error: {e}")
+        return OR_CACHE["items"], f"网络错误（{e.__class__.__name__}）"
+
+    items = []
+    for m in data:
+        mid = m.get("id") or ""
+        if not mid:
+            continue
+        p = m.get("pricing") or {}
+        is_free = mid.endswith(":free") or (
+            str(p.get("prompt")) == "0" and str(p.get("completion")) == "0"
+        )
+        if not is_free:
+            continue
+        # chat models only: text-out models such as classifiers/routers stay,
+        # but audio/image generators are dropped
+        out_mods = (m.get("architecture") or {}).get("output_modalities") or []
+        if "text" not in out_mods or "audio" in out_mods or "image" in out_mods:
+            continue
+        items.append({
+            "id": mid,
+            "ctx": m.get("context_length") or 0,
+            "score": _or_capability_score(m),
+        })
+    items.sort(key=lambda x: (-x["score"], -x["ctx"], x["id"]))
+    OR_CACHE["items"] = items
+    OR_CACHE["ts"] = now
+    logger.info(f"Fetched {len(items)} free OpenRouter models")
+    return items, None
+
+
+def build_or_free_panel(page: int, items, err=None, note: str = ""):
+    """Paginated list of free OpenRouter models, ranked by capability."""
+    if not items:
+        text = (
+            "📥 **OpenRouter 免费模型**\n\n"
+            f"❌ 拉取失败：{_md_safe(err or '无数据')}\n\n"
+            "可以稍后重试，或返回后用「修改分类/回骂模型」手动输入。"
+        )
+        return text, InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 重新拉取", callback_data="or_free_refresh")],
+            [InlineKeyboardButton("↩ 返回自定义模型", callback_data="ai_model_panel")],
+        ])
+
+    total_pages = max(1, (len(items) + OR_PER_PAGE - 1) // OR_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * OR_PER_PAGE
+    chunk = items[start:start + OR_PER_PAGE]
+
+    lines = [
+        "📥 **OpenRouter 免费模型**（按能力排序）",
+        f"共 {len(items)} 个 · 第 {page + 1}/{total_pages} 页",
+        "",
+    ]
+    if note:
+        lines.append(note)
+        lines.append("")
+    for i, it in enumerate(chunk, start + 1):
+        lines.append(f"{i}. {_md_safe(it['id'])}")
+        lines.append(f"   ctx {_fmt_ctx(it['ctx'])} · 评分 {it['score']:.0f}")
+    lines.append("")
+    lines.append("点下方数字按钮选择：")
+
+    rows = []
+    nums = [InlineKeyboardButton(str(i), callback_data=f"or_pick_{i - 1}")
+            for i in range(start + 1, start + 1 + len(chunk))]
+    for k in range(0, len(nums), 4):
+        rows.append(nums[k:k + 4])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀ 上一页", callback_data=f"or_free_p{page - 1}"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("下一页 ▶", callback_data=f"or_free_p{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("🔄 重新拉取", callback_data="or_free_refresh")])
+    rows.append([InlineKeyboardButton("↩ 返回自定义模型", callback_data="ai_model_panel")])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+def build_or_confirm_panel(model_id: str, ctx: int):
+    """Confirm which slot the chosen free model should fill."""
+    text = (
+        "✅ **已选择模型**\n\n"
+        f"{_md_safe(model_id)}\n"
+        f"上下文：{_fmt_ctx(ctx)}\n\n"
+        "要把它设为哪个模型？（平台将自动切到 openrouter）"
+    )
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔍 分类模型", callback_data="or_use_classify")],
+        [InlineKeyboardButton("🤬 回骂模型", callback_data="or_use_insult")],
+        [InlineKeyboardButton("↩ 返回列表", callback_data="or_free_p0")],
+    ])
+    return text, markup
+
+
 def build_ai_model_panel():
     """Model customization panel."""
     classify_model = cfg.get("ai", {}).get("classify_model", "未设置")
     insult_model = cfg.get("ai", {}).get("insult_model", "未设置")
+    platform = cfg.get("ai", {}).get("platform", "未设置")
     text = (
         "🧠 **自定义模型**\n\n"
-        f"分类模型：{classify_model}\n"
-        f"回骂模型：{insult_model}\n\n"
+        f"平台：{_md_safe(platform)}\n"
+        f"分类模型：{_md_safe(classify_model)}\n"
+        f"回骂模型：{_md_safe(insult_model)}\n\n"
         "点击下方按钮修改模型："
     )
     markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📥 OpenRouter 免费模型（按能力排序）", callback_data="or_free_p0")],
         [InlineKeyboardButton("🔍 修改分类模型", callback_data="ai_set_classify_model")],
         [InlineKeyboardButton("🤬 修改回骂模型", callback_data="ai_set_insult_model")],
         [InlineKeyboardButton("↩ 返回 AI 设置", callback_data="ai_settings")],
@@ -1889,7 +2073,7 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Owner text: either keyword-adding mode or reply forwarding."""
-    global AI_AUTO_ENABLED, AI_ENABLED, AI_ABUSE_MANUAL_OFF, cfg
+    global AI_AUTO_ENABLED, AI_ENABLED, AI_ABUSE_MANUAL_OFF, cfg, AI_API_KEY, AI_BASE_URL, AI_PLATFORM, _last_ai_check
     msg = update.message
     if not msg or not msg.text:
         return
@@ -1945,6 +2129,17 @@ async def handle_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not model_name or len(model_name) < 3:
             await msg.reply_text("❌ 模型名无效（太短），请重试")
             return
+        if model_name.startswith(("sk-", "sk-or-")) or " " in model_name:
+            await msg.reply_text(
+                "❌ 这看起来是 API 密钥，不是模型名。\n\n"
+                "模型名示例：`deepseek-ai/DeepSeek-V4-Flash`\n"
+                "要改密钥请走 🔑 API 密钥管理",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("↩ 返回 AI 设置", callback_data="ai_settings")]
+                ])
+            )
+            return
         cfg["ai"][mode] = model_name
         save_config(cfg)
         if mode == "classify_model":
@@ -1972,15 +2167,24 @@ async def handle_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not new_key or len(new_key) < 3:
             await msg.reply_text("❌ 密钥无效（太短），请重试")
             return
-        global AI_API_KEY
+        new_base_url = PLATFORM_BASE_URLS.get(platform, AI_BASE_URL)
+        if new_key.startswith("sk-or-") and platform == "siliconflow":
+            platform = "openrouter"
+            new_base_url = PLATFORM_BASE_URLS["openrouter"]
         cfg["ai"]["api_key"] = new_key
         cfg["ai"]["platform"] = platform
+        cfg["ai"]["base_url"] = new_base_url
         save_config(cfg)
         AI_API_KEY = new_key
+        AI_BASE_URL = new_base_url
+        AI_PLATFORM = platform
+        _last_ai_check = None
         AI_AUTO_ENABLED = (new_key.strip() != "")
         AI_ENABLED = AI_AUTO_ENABLED and not AI_ABUSE_MANUAL_OFF
         await msg.reply_text(
-            f"✅ {platform} API 密钥已更新\n\nAI 自动启用：{'✅' if AI_ENABLED else '❌'}",
+            f"✅ {platform} API 密钥已更新\n"
+            f"接口地址：{AI_BASE_URL}\n\n"
+            f"AI 自动启用：{'✅' if AI_ENABLED else '❌'}",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("↩ 返回 AI 设置", callback_data="ai_settings")]
             ])
@@ -2047,11 +2251,13 @@ ai_setkey_waiting: set[int] = set()
 ai_setkey_platform: dict[int, str] = {}
 # Track which owner is waiting for AI model name input
 ai_model_waiting: dict[int, str] = {}  # uid -> "classify_model" | "insult_model"
+# (OR_SNAPSHOT / OR_PENDING are declared with the OpenRouter discovery helpers)
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle all inline button callbacks from owner."""
     global AI_ABUSE_MANUAL_OFF, AI_ENABLED, cfg, _last_ai_check, ai_setkey_waiting, ai_setkey_platform
+    global CLASSIFY_MODEL, INSULT_MODEL, AI_BASE_URL, AI_PLATFORM
     query = update.callback_query
     logger.info(f"Callback query received: data={query.data}, from={query.from_user.id}")
 
@@ -2110,6 +2316,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- Settings sub-menu ===
     # --- AI settings ---
     if data == "ai_settings":
+        # Leaving any input mode: drop pending text-input state
+        ai_model_waiting.pop(chat_id, None)
+        ai_setkey_waiting.discard(chat_id)
+        ai_setkey_platform.pop(chat_id, None)
+        OR_PENDING.pop(chat_id, None)
         # Auto-check AI connection on first visit (cache empty)
         if AI_AUTO_ENABLED and _last_ai_check is None:
             try:
@@ -2429,6 +2640,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- AI API key panel ---
     if data == "ai_apikey_panel":
+        ai_model_waiting.pop(chat_id, None)
         content, markup = build_ai_apikey_panel()
         await edit(content, markup)
         return
@@ -2437,12 +2649,79 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("ai_setkey_platform_"):
         platform = data.split("_")[3]  # siliconflow or openrouter
         await query.answer(f"💬 请在聊天框输入 {platform} 的新 API 密钥，或发送 /cancel 取消", show_alert=True)
+        ai_model_waiting.pop(chat_id, None)  # mutually exclusive with key mode
         ai_setkey_waiting.add(chat_id)
         ai_setkey_platform[chat_id] = platform
         return
 
+    # --- OpenRouter free model list (fetch / paginate) ---
+    if data == "or_free_refresh" or data.startswith("or_free_p"):
+        page = 0
+        if data.startswith("or_free_p"):
+            try:
+                page = int(data[len("or_free_p"):])
+            except ValueError:
+                page = 0
+        items, err = await fetch_openrouter_free_models(force=(data == "or_free_refresh"))
+        note = ""
+        if err and items:
+            note = f"⚠️ 刷新失败（{_md_safe(err)}），以下为缓存结果"
+        OR_SNAPSHOT[chat_id] = [(it["id"], it["ctx"]) for it in items]
+        content, markup = build_or_free_panel(page, items, err, note)
+        await edit(content, markup)
+        return
+
+    # --- OpenRouter free model picked: choose target slot ---
+    if data.startswith("or_pick_"):
+        try:
+            idx = int(data[len("or_pick_"):])
+        except ValueError:
+            idx = -1
+        snap = OR_SNAPSHOT.get(chat_id) or []
+        if idx < 0 or idx >= len(snap):
+            await query.answer("❌ 列表已过期，请重新打开免费模型列表", show_alert=True)
+            return
+        mid, mctx = snap[idx]
+        OR_PENDING[chat_id] = mid
+        content, markup = build_or_confirm_panel(mid, mctx)
+        await edit(content, markup)
+        return
+
+    # --- Apply chosen free model (platform auto-switches to openrouter) ---
+    if data in ("or_use_classify", "or_use_insult"):
+        mode = "classify_model" if data == "or_use_classify" else "insult_model"
+        label = "分类" if mode == "classify_model" else "回骂"
+        model_id = OR_PENDING.pop(chat_id, None)
+        if not model_id:
+            await query.answer("❌ 选择已失效，请重新选择", show_alert=True)
+            return
+        new_base = PLATFORM_BASE_URLS["openrouter"]
+        cfg["ai"][mode] = model_id
+        cfg["ai"]["platform"] = "openrouter"
+        cfg["ai"]["base_url"] = new_base
+        save_config(cfg)
+        if mode == "classify_model":
+            CLASSIFY_MODEL = model_id
+        else:
+            INSULT_MODEL = model_id
+        AI_BASE_URL = new_base
+        AI_PLATFORM = "openrouter"
+        _last_ai_check = None
+        content, markup = build_ai_model_panel()
+        await edit(
+            f"✅ {label}模型已更新\n\n"
+            f"{_md_safe(model_id)}\n"
+            f"平台已切换到 openrouter\n{_md_safe(AI_BASE_URL)}\n\n" + content,
+            markup
+        )
+        logger.info(f"Owner set {mode} to {model_id} (openrouter)")
+        return
+
     # --- AI model panel ---
     if data == "ai_model_panel":
+        ai_setkey_waiting.discard(chat_id)
+        ai_setkey_platform.pop(chat_id, None)
+        OR_PENDING.pop(chat_id, None)
         content, markup = build_ai_model_panel()
         await edit(content, markup)
         return
@@ -2450,11 +2729,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- AI model change (sets waiting state for text input) ---
     if data == "ai_set_classify_model":
         await query.answer("💬 请在聊天框输入新的分类模型名，或发送 /cancel 取消", show_alert=True)
+        ai_setkey_waiting.discard(chat_id)
+        ai_setkey_platform.pop(chat_id, None)
         ai_model_waiting[chat_id] = "classify_model"
         return
 
     if data == "ai_set_insult_model":
         await query.answer("💬 请在聊天框输入新的回骂模型名，或发送 /cancel 取消", show_alert=True)
+        ai_setkey_waiting.discard(chat_id)
+        ai_setkey_platform.pop(chat_id, None)
         ai_model_waiting[chat_id] = "insult_model"
         return
 
@@ -2753,6 +3036,32 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
 
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel any pending text-input mode (model / API key / search / editing)."""
+    msg = update.message
+    if not msg or not msg.from_user or msg.from_user.id != OWNER_ID:
+        return
+    uid = msg.from_user.id
+    done = []
+    if ai_model_waiting.pop(uid, None):
+        done.append("模型修改")
+    if uid in ai_setkey_waiting:
+        ai_setkey_waiting.discard(uid)
+        ai_setkey_platform.pop(uid, None)
+        done.append("密钥修改")
+    if uid in search_active:
+        search_active.discard(uid)
+        done.append("用户搜索")
+    if uid in auto_reply_editing:
+        auto_reply_editing.discard(uid)
+        done.append("自动回复编辑")
+    if uid in kw_adding:
+        del kw_adding[uid]
+        done.append("屏蔽词编辑")
+    text = f"✅ 已取消：{'、'.join(done)}" if done else "✅ 当前没有待输入的操作"
+    await msg.reply_text(text)
+
+
 async def cmd_cancel_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel auto-reply text editing or keyword adding."""
     msg = update.message
@@ -2987,6 +3296,7 @@ async def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(CommandHandler("cancel_edit", cmd_cancel_edit))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
     # Owner text: process editing modes first, then reply forwarding
     # Single handler with explicit priority — editing modes consume, otherwise fall through to reply forwarding
     app.add_handler(MessageHandler(
