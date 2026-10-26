@@ -11,6 +11,15 @@
     "abuse_manual_off": false
   },
   "welcome_msg": "👋 你好，这是消息转发助手。\n\n你的留言将会被转发给管理员，他会通过这个机器人回复你。\n⚠️ 请勿发送广告或骚扰信息。\n\n有什么想说的，直接发过来吧~",
+  "suppress_enabled": true,
+  "suppress_sec": 300,
+  "batch_window_sec": 8,
+  "batch_max_wait_sec": 30,
+  "suppress_notice_enabled": true,
+  "suppress_notice_text": "⏳ 你已被暂时限制，冷却期内的消息不会被转发给管理员。",
+  "name_check_enabled": true,
+  "name_min_kw_len": 2,
+  "name_notice_text": "⚠️ 你的昵称/用户名疑似广告推广，请先把昵称改成正常内容，再发消息。",
   "utc_offset": null,
   "server_location": null
 }

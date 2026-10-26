@@ -14,9 +14,9 @@ Features:
 - Blocked user management, auto-reply, keyword management
 """
 
-__version__ = "1.9.1"
+__version__ = "1.10.0"
 
-import asyncio, json, logging, os, re, signal, sys, time
+import asyncio, json, logging, os, re, signal, sys, time, unicodedata
 import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
@@ -62,6 +62,27 @@ PLATFORM_BASE_URLS = {
 }
 CLASSIFY_MODEL = cfg.get("ai", {}).get("classify_model", "qwen/qwen3-next-80b-a3b-instruct:free")
 INSULT_MODEL = cfg.get("ai", {}).get("insult_model", "google/gemma-4-31b-it:free")
+
+# === Anti-spam suppression + batch window (configurable via panel) ===
+SUPPRESS_ENABLED = bool(cfg.get("suppress_enabled", True))
+SUPPRESS_SEC = float(cfg.get("suppress_sec", 300))
+BATCH_WINDOW_SEC = float(cfg.get("batch_window_sec", 8))
+BATCH_MAX_WAIT_SEC = float(cfg.get("batch_max_wait_sec", 30))
+# Cooldown notice: reply once per cooldown window instead of dropping silently
+SUPPRESS_NOTICE_ENABLED = bool(cfg.get("suppress_notice_enabled", True))
+SUPPRESS_NOTICE_TEXT = cfg.get(
+    "suppress_notice_text",
+    "⏳ 你已被暂时限制，冷却期内的消息不会被转发给管理员。"
+)
+
+# === Nickname / username ad detection (ads hidden in display names) ===
+# Spammers send harmless text ("你好") and put the ad in their display name.
+NAME_CHECK_ENABLED = bool(cfg.get("name_check_enabled", True))
+NAME_MIN_KW_LEN = int(cfg.get("name_min_kw_len", 2))
+NAME_NOTICE_TEXT = cfg.get(
+    "name_notice_text",
+    "⚠️ 你的昵称/用户名疑似广告推广，请先把昵称改成正常内容，再发消息。"
+)
 
 # === Timezone: null = auto (server local), int = UTC offset ===
 UTC_OFFSET = cfg.get("utc_offset")  # None (auto) or int like 8, -5
@@ -205,7 +226,8 @@ class State:
                                     "abuse_count": 0, "has_forwarded": False,
                                     "last_fwd_msg_id": 0, "last_active": "",
                                     "ai_insult_count": 0, "last_msg_time": "",
-                                    "abuse_history": []})
+                                    "abuse_history": [], "suppress_until": 0,
+                                    "suppress_notified_until": 0})
 
     def get(self, uid):
         # Read-only snapshot: safe without lock since dict reads are atomic in CPython
@@ -491,6 +513,111 @@ def local_check(text: str):
     return ("MAYBE", [])
 
 
+# ============================================================
+# Nickname / username ad detection
+# Spammers send harmless text ("你好") and hide the ad in the display name,
+# e.g. "🎁福利群 @xxx", "加V：abc123", "兼职日赚". So the name is screened too.
+# ============================================================
+
+# Keep only CJK + latin letters + digits: drops emoji, spaces, punctuation and
+# separators that spammers use to break keyword matching ("加❤️微", "推·广").
+_NAME_CLEAN_RE = re.compile(r"[^0-9a-z\u4e00-\u9fff]+", re.I)
+_NAME_URL_RE = re.compile(r"(https?://|www\.|t\.me/|tg://|\.com\b|\.cn\b|\.net\b)", re.I)
+_NAME_CONTACT_RE = re.compile(
+    r"(微信|徽信|薇信|微号|weixin|wechat|wx|vx|qq|扣扣|电话|手机)\s*[:：]?\s*\d{4,}", re.I
+)
+# "微信：kf8888" style — a contact keyword followed by an explicit separator and an ID
+_NAME_CONTACT_ID_RE = re.compile(
+    r"(微信|徽信|薇信|威信|威心|微号|weixin|wechat|wx|vx|qq|扣扣|v)\s*[:：]\s*[\w\-]{4,}", re.I
+)
+# Phone number used as a display name (pure digits / +86 ...) = 引流, not a real name
+_NAME_PHONE_RE = re.compile(r"^[\s+()\-]*(?:\+?\d[\s\-()]*){8,}$")
+
+# Extra ad words that are common in display names but not in the cloud spam list.
+# Names are short, so a few "container" words catch a lot: 「福利群」「出U」「带单」.
+NAME_EXTRA_SPAM_KW = (
+    "福利群", "资源群", "内部群", "拉群", "加群", "交流群", "群组", "频道", "互赞", "涨粉",
+    "引流", "私域", "出粉", "出号", "卖号", "租号", "实名号", "老号", "权重号", "一手号",
+    "日结", "躺赚", "稳赚", "包赚", "带单", "回血", "上岸", "撸毛", "羊毛", "空投",
+    "币圈", "合约", "usdt", "泰达", "出u", "收u", "承兑", "上分", "下分", "代充",
+    "代理", "招代", "招商加盟", "加盟", "一件代发", "货源", "批发", "低价", "秒杀", "清仓",
+    "看我资料", "看签名", "点我头像", "主页有", "私我", "滴滴我", "戳我", "找我聊",
+    "薇信", "徽信", "威信", "威心", "加薇", "伽薇", "茄薇", "加徽", "微我", "私信我",
+)
+
+# Cloud keywords that are too generic to judge a *display name* on
+# (a real user may well be called "XX设计工作室"). Messages still match them.
+NAME_IGNORE_KW = {
+    "工作室", "讨论组", "咨询我", "联系我", "私聊我", "看名字", "无广告", "无广告群",
+}
+NAME_IGNORE_KW_SET = {k.lower() for k in NAME_IGNORE_KW}
+
+
+def normalize_name(text: str) -> str:
+    """Aggressively normalize a display name for keyword matching."""
+    if not text:
+        return ""
+    s = unicodedata.normalize("NFKC", text).lower()
+    return _NAME_CLEAN_RE.sub("", s)
+
+
+def _is_ascii_word(kw: str) -> bool:
+    return all(ord(ch) < 128 for ch in kw)
+
+
+def name_check(full_name: str, username: str = ""):
+    """Screen a user's display name / @username for ads (or abuse).
+
+    Returns (label, [matched]) - label: OK / SPAM / ABUSE.
+    SPAM wins over ABUSE: an ad in the name is what we care about here.
+    Repeated messages from the same ad-named user are handled by the cooldown.
+    """
+    if not NAME_CHECK_ENABLED:
+        return ("OK", [])
+    parts = [normalize_name(full_name), normalize_name(username)]
+    if not any(parts):
+        return ("OK", [])
+
+    spam_hits, abuse_hits = [], []
+    for part in parts:
+        if not part:
+            continue
+        for kw in SPAM_KW:
+            k = kw.lower()
+            if len(k) < NAME_MIN_KW_LEN or k in NAME_IGNORE_KW_SET:
+                continue
+            if k in part:
+                spam_hits.append(kw)
+        for kw in NAME_EXTRA_SPAM_KW:
+            if kw in part:
+                spam_hits.append(kw)
+        # ASCII abuse words ("sb", "nima") false-positive inside normal names
+        # ("usbking", "animas"), so only CJK abuse words are matched on names.
+        for kw in ABUSE_KW:
+            k = kw.lower()
+            if len(k) < NAME_MIN_KW_LEN or _is_ascii_word(k):
+                continue
+            if k in part:
+                abuse_hits.append(kw)
+
+    if not spam_hits:
+        raw = f"{full_name or ''} {username or ''}"
+        if _NAME_URL_RE.search(raw):
+            spam_hits.append("链接/用户名引流")
+        if _NAME_CONTACT_RE.search(unicodedata.normalize("NFKC", raw)):
+            spam_hits.append("联系方式")
+        if _NAME_CONTACT_ID_RE.search(unicodedata.normalize("NFKC", raw)):
+            spam_hits.append("联系方式")
+        if _NAME_PHONE_RE.match(raw.strip()):
+            spam_hits.append("手机号昵称")
+
+    if spam_hits:
+        return ("SPAM", spam_hits[:5])
+    if abuse_hits:
+        return ("ABUSE", abuse_hits[:5])
+    return ("OK", [])
+
+
 async def ai_classify(text: str) -> str:
     """Cheap model (Qwen2.5-7B) to classify message. Returns SPAM/ABUSE/SPAM+ABUSE/OK."""
     prompt = f"""判断以下消息类别：
@@ -704,25 +831,44 @@ async def tag_forwarded_message(fwd_msg_id: int, tag: str, original_text: str = 
 
 
 # ============================================================
-# Batch delay queue for unapproved users (5s window)
+# Batch delay queue for unapproved users (configurable debounce window)
 # uid → {"messages": [{"text":str, "local":str, "matched":list, "msg_id":int,
 #                      "full_name":str, "username":str}, ...],
-#         "timer_task": asyncio.Task}
+#         "first_ts": float, "timer_task": asyncio.Task}
 _pending_queues: dict[int, dict] = {}
-BATCH_WINDOW_SEC = 5
 
 
-async def ai_classify_batch(messages: list[dict]) -> tuple[dict[int, str], str]:
+def _suppress_until_ts() -> float:
+    """Epoch seconds until which an unapproved user's messages are dropped (0 = off)."""
+    if not SUPPRESS_ENABLED:
+        return 0.0
+    return time.time() + SUPPRESS_SEC
+
+
+def _is_suppressed(us: dict) -> bool:
+    """True if the user is inside the post-spam/abuse cooldown window."""
+    if not SUPPRESS_ENABLED:
+        return False
+    try:
+        return float(us.get("suppress_until", 0) or 0) > time.time()
+    except (TypeError, ValueError):
+        return False
+
+
+async def ai_classify_batch(messages: list[dict], profile: str = "") -> tuple[dict[int, str], str]:
     """Batch AI classify: returns ({index: label}, overall_label).
     
     Sends all messages together for context-aware per-message + overall judgement.
+    profile: optional "昵称：X 用户名：@Y" line — name ads count as SPAM even when
+    the message text is harmless ("你好").
     """
     if not messages:
         return ({}, "OK")
 
+    profile_block = f"用户资料：{profile}\n\n" if profile else ""
     # Build prompt with numbered messages
     msgs_text = "\n".join(f"[消息{i+1}] {m['text'][:500]}" for i, m in enumerate(messages))
-    prompt = f"""判断以下多组消息的类别，从两个角度分析：
+    prompt = f"""{profile_block}判断以下多组消息的类别，从两个角度分析：
 
 1. 逐条分析每条消息是否包含广告/辱骂：
    ABUSE = 辱骂/脏话/人身攻击
@@ -731,6 +877,9 @@ async def ai_classify_batch(messages: list[dict]) -> tuple[dict[int, str], str]:
 
 2. 整体分析：这几条消息合在一起，是否构成明显的广告行为？
    即使每条单独看起来正常，但组合在一起明显是广告/推广的，也要判定为 SPAM。
+   特别注意：如果用户的昵称/用户名本身是广告推广（诱导加微信/QQ、拉群、卖货、
+   引流涨粉、兼职日赚、代开发票、资源出售等），那么即使消息内容只是「你好」
+   「在吗」这类寒暄，也必须判定 OVERALL:SPAM。
 
 {msgs_text}
 
@@ -822,6 +971,7 @@ async def _flush_pending_queue(uid: int):
         spam_c += local_hit_count
         stats_add("ads_blocked", local_hit_count)
         update_kw = {"spam_count": spam_c, "blocked": True,
+                     "suppress_until": _suppress_until_ts(),
                      "last_active": now, "last_msg_time": now, "msgs_checked": 0}
         await send_msg(uid, "滚吧，广告狗，你已被拉黑。")
         await state.update(uid, **update_kw)
@@ -834,8 +984,17 @@ async def _flush_pending_queue(uid: int):
     overall = "OK"
     to_classify = [m for m in msgs if m["local"] in ("MAYBE", "OK")]
 
+    # Display name context: ads in the nickname count as SPAM even for "你好"
+    first = msgs[0]
+    profile_bits = []
+    if first.get("full_name"):
+        profile_bits.append(f"昵称：{first['full_name']}")
+    if first.get("username"):
+        profile_bits.append(f"用户名：@{first['username']}")
+    profile = "，".join(profile_bits)
+
     if AI_ENABLED and to_classify:
-        batch_labels, overall = await ai_classify_batch(to_classify)
+        batch_labels, overall = await ai_classify_batch(to_classify, profile)
         # Map batch indices back to original message indices
         for bi, label in batch_labels.items():
             if label in ("SPAM", "ABUSE"):
@@ -858,9 +1017,13 @@ async def _flush_pending_queue(uid: int):
             await record_blocked_content(uid, m["text"], m["local"].lower(), m.get("matched"))
         for oi, label in ai_labels.items():
             await record_blocked_content(uid, msgs[oi]["text"], label.lower(), ["AI"])
+        if not local_spam_abuse and not ai_labels:
+            # AI flagged the batch only because of the display name
+            await record_blocked_content(uid, f"[昵称] {profile}", "nickname", ["AI"])
         spam_c += total_hits
-        stats_add("ads_blocked", total_hits)
+        stats_add("ads_blocked", max(1, total_hits))
         update_kw = {"spam_count": spam_c, "blocked": True,
+                     "suppress_until": _suppress_until_ts(),
                      "last_active": now, "last_msg_time": now, "msgs_checked": 0}
         await send_msg(uid, "滚吧，广告狗，你已被拉黑。")
         await state.update(uid, **update_kw)
@@ -868,41 +1031,22 @@ async def _flush_pending_queue(uid: int):
         return
 
     if total_hits == 1:
-        # === Single hit: block that one, forward the rest ===
+        # === Single hit: suppress the WHOLE batch ===
+        # Spammers often follow an ad with filler ("打扰了"); do not forward the rest.
         hit_idx = None
         if local_spam_abuse:
             hit_idx = local_spam_abuse[0][0]
         elif ai_labels:
             hit_idx = next(iter(ai_labels))
 
-        spam_c += 1
-        stats_add("ads_blocked")
+        hit_label = (local_spam_abuse[0][1]["local"] if local_spam_abuse
+                     else ai_labels[hit_idx]).lower()
+        await record_blocked_content(uid, msgs[hit_idx]["text"], hit_label,
+                                     msgs[hit_idx].get("matched") or ["AI"])
 
-        last_fwd_id = 0
-        forwarded_count = 0
-        for i, m in enumerate(msgs):
-            if i == hit_idx:
-                # Reply to the spam message
-                await record_blocked_content(uid, m["text"],
-                    (local_spam_abuse[0][1]["local"] if local_spam_abuse else ai_labels[hit_idx]).lower(),
-                    m.get("matched") or ["AI"])
-                await send_msg(uid, "请勿发送广告。", reply_to_message_id=m["msg_id"])
-            else:
-                fwd_id = await forward_to_owner(uid, m.get("full_name", ""), m.get("username", ""),
-                                                m["text"], spam_c, 0)
-                if fwd_id:
-                    last_fwd_id = fwd_id
-                forwarded_count += 1
-                logger.info(f"Batch for user {uid}: msg[{i}] OK → forwarded")
-
-        checked = us.get("msgs_checked", 0) + forwarded_count
-        update_kw = {"msgs_checked": checked, "spam_count": spam_c,
-                     "last_active": now, "last_msg_time": now}
-        if last_fwd_id:
-            update_kw["has_forwarded"] = True
-            update_kw["last_fwd_msg_id"] = last_fwd_id
-        await state.update(uid, **update_kw)
-        logger.info(f"Batch for user {uid}: 1 hit → blocked that one, forwarded {forwarded_count}, spam_count={spam_c}")
+        spam_c = await apply_spam_hit(uid, spam_c, now, msgs[hit_idx]["msg_id"], source="text")
+        logger.info(f"Batch for user {uid}: 1 hit → whole batch suppressed "
+                    f"(dropped {max(0, len(msgs) - 1)} non-hit msg), spam_count={spam_c}")
         return
 
     # === 0 hits: forward all ===
@@ -912,6 +1056,7 @@ async def _flush_pending_queue(uid: int):
                  "last_active": now, "last_msg_time": now}
     if checked >= 10:
         update_kw["approved"] = True
+        update_kw["suppress_until"] = 0
         logger.info(f"User {uid} APPROVED (continuous {checked} OK)")
 
     last_fwd_id = 0
@@ -943,8 +1088,19 @@ async def _cancel_pending_timer(uid: int):
         entry["timer_task"].cancel()
 
 
-async def _schedule_batch_flush(uid: int, delay: float = BATCH_WINDOW_SEC):
-    """Schedule (or reschedule) a timer to flush the pending queue for a user."""
+async def _schedule_batch_flush(uid: int, delay: float | None = None):
+    """Schedule (or reschedule) a timer to flush the pending queue for a user.
+
+    The window resets on each new message (debounce), but a batch is never held
+    longer than BATCH_MAX_WAIT_SEC after its first message.
+    """
+    if delay is None:
+        delay = BATCH_WINDOW_SEC
+    entry = _pending_queues.get(uid)
+    if entry:
+        first_ts = entry.get("first_ts") or time.time()
+        cap = first_ts + BATCH_MAX_WAIT_SEC
+        delay = max(0.5, min(delay, cap - time.time()))
     await _cancel_pending_timer(uid)
     async def _timer():
         await asyncio.sleep(delay)
@@ -952,6 +1108,35 @@ async def _schedule_batch_flush(uid: int, delay: float = BATCH_WINDOW_SEC):
     task = asyncio.create_task(_timer())
     if uid in _pending_queues:
         _pending_queues[uid]["timer_task"] = task
+
+
+SPAM_ESCALATION_TEXT = ("请勿发送广告。", "请注意言辞，再发广告将被拉黑。", "你已被拉黑，滚吧。")
+NAME_ESCALATION_TEXT = (
+    NAME_NOTICE_TEXT,
+    "⚠️ 警告：昵称/用户名仍是广告内容，再发一次将拉黑。",
+    "你已被拉黑，滚吧。",
+)
+
+
+async def apply_spam_hit(uid: int, spam_c: int, now: str, reply_to_msg_id: int = 0,
+                         source: str = "text") -> int:
+    """Shared SPAM escalation: warn → warn → block.
+
+    source: "text" = ad in the message body, "name" = ad in the display name.
+    Returns the updated spam_count.
+    """
+    spam_c += 1
+    stats_add("ads_blocked")
+    update_kw = {"spam_count": spam_c, "suppress_until": _suppress_until_ts(),
+                 "last_active": now, "last_msg_time": now, "msgs_checked": 0}
+    texts = NAME_ESCALATION_TEXT if source == "name" else SPAM_ESCALATION_TEXT
+    if spam_c >= 3:
+        update_kw["blocked"] = True
+        await send_msg(uid, texts[2], reply_to_message_id=reply_to_msg_id)
+    else:
+        await send_msg(uid, texts[spam_c - 1], reply_to_message_id=reply_to_msg_id)
+    await state.update(uid, **update_kw)
+    return spam_c
 
 
 async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -967,7 +1152,7 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_msg(sid, msg.text)
             logger.info(f"Owner replied to stranger {sid}")
             if sid in state.users:
-                await state.update(sid, approved=True)
+                await state.update(sid, approved=True, suppress_until=0)
                 logger.info(f"Auto-approved user {sid} (owner replied)")
         return
 
@@ -980,7 +1165,34 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"Blocked user {user.id} attempted message")
         return
 
+    # === Cooldown: unapproved user who recently sent spam/abuse → drop ===
+    if not us.get("approved") and _is_suppressed(us):
+        until = float(us.get("suppress_until", 0) or 0)
+        if SUPPRESS_NOTICE_ENABLED and float(us.get("suppress_notified_until", 0) or 0) < until:
+            # Notify once per cooldown window, then stay silent for the rest
+            await send_msg(user.id, SUPPRESS_NOTICE_TEXT)
+            await state.update(user.id, suppress_notified_until=until)
+            logger.info(f"Suppressed user {user.id} notified (cooldown active)")
+        else:
+            logger.info(f"Suppressed user {user.id} msg dropped (cooldown active)")
+        return
+
     spam_c = us.get("spam_count", 0)
+
+    # === 1a. Nickname / username ad check (unapproved users only) ===
+    # Ads often hide in the display name while the text is just "你好".
+    if not us.get("approved"):
+        nlabel, nmatched = name_check(user.full_name or "", user.username or "")
+        if nlabel in ("SPAM", "ABUSE"):
+            label_desc = f"[昵称] {user.full_name or ''} @{user.username or ''}".strip()
+            await record_blocked_content(user.id, label_desc, "nickname", nmatched)
+            spam_c = await apply_spam_hit(user.id, spam_c, now, msg.message_id, source="name")
+            logger.info(
+                f"NICKNAME-{nlabel} from {user.id} "
+                f"({user.full_name!r} @{user.username!r}, matched={nmatched[:5]}, "
+                f"spam #{spam_c}) → auto-replied, message NOT forwarded"
+            )
+            return
 
     # === 1. Local ABUSE check ===
     local, matched_kws = local_check(text)
@@ -989,6 +1201,7 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
         abuse_c = us.get("abuse_count", 0) + 1
         checked = 0
         update_kw = {"msgs_checked": checked, "spam_count": spam_c, "abuse_count": abuse_c,
+                     "suppress_until": _suppress_until_ts(),
                      "last_active": now, "last_msg_time": now}
         if abuse_c >= 2:
             if AI_ENABLED:
@@ -1009,21 +1222,7 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # === 2. Local SPAM check ===
     if local == "SPAM":
         await record_blocked_content(user.id, text, "spam", matched_kws)
-        spam_c += 1
-        checked = 0
-        update_kw = {"msgs_checked": checked, "spam_count": spam_c,
-                     "last_active": now, "last_msg_time": now}
-        if spam_c == 1:
-            stats_add("ads_blocked")
-            await send_msg(user.id, "请勿发送广告。", reply_to_message_id=msg.message_id)
-        elif spam_c == 2:
-            stats_add("ads_blocked")
-            await send_msg(user.id, "请注意言辞，再发广告将被拉黑。", reply_to_message_id=msg.message_id)
-        else:
-            stats_add("ads_blocked")
-            update_kw["blocked"] = True
-            await send_msg(user.id, "你已被拉黑，滚吧。", reply_to_message_id=msg.message_id)
-        await state.update(user.id, **update_kw)
+        spam_c = await apply_spam_hit(user.id, spam_c, now, msg.message_id, source="text")
         logger.info(f"SPAM from {user.id} (local hit, spam #{spam_c}) → auto-replied")
         return
 
@@ -1063,7 +1262,7 @@ async def handle_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
 
     if user.id not in _pending_queues:
-        _pending_queues[user.id] = {"messages": [], "timer_task": None}
+        _pending_queues[user.id] = {"messages": [], "first_ts": time.time(), "timer_task": None}
     _pending_queues[user.id]["messages"].append(msg_entry)
 
     logger.info(f"User {user.id} unapproved → queued (batch size={len(_pending_queues[user.id]['messages'])}, local={local_label})")
@@ -1348,6 +1547,7 @@ def build_settings_menu():
         [InlineKeyboardButton(f"🔑 屏蔽词管理 ({na}+{ns})", callback_data="kw_menu")],
         [InlineKeyboardButton("💬 欢迎词设置", callback_data="welcome_panel")],
         [InlineKeyboardButton("🤖 自动回复设置", callback_data="autoreply")],
+        [InlineKeyboardButton("🛡️ 反垃圾设置", callback_data="antispam")],
         [InlineKeyboardButton("🤖 AI 设置", callback_data="ai_settings")],
         [InlineKeyboardButton("🕐 时区设置", callback_data="timezone")],
         [InlineKeyboardButton("🔄 检查更新", callback_data="check_update")],
@@ -1356,6 +1556,60 @@ def build_settings_menu():
     ])
     return text, markup
 
+
+def build_antispam_panel():
+    """Anti-spam (suppression + batch window) settings panel."""
+    on = "✅ 开启" if SUPPRESS_ENABLED else "❌ 关闭"
+    notice = "✅ 开启" if SUPPRESS_NOTICE_ENABLED else "❌ 关闭"
+    name_state = "✅ 开启" if NAME_CHECK_ENABLED else "❌ 关闭"
+    text = (
+        "🛡️ **反垃圾设置**\n\n"
+        f"**昵称检测**：{name_state}\n"
+        "开启后，未批准用户的昵称/用户名也会查词库，"
+        "只发「你好」但昵称是广告的会被直接拦下。\n\n"
+        f"**冷却抑制**：{on}\n"
+        "开启后，未批准用户一旦触发广告/滥用，"
+        "冷却期内其后续消息（如「打扰了」）不会被转发。\n\n"
+        f"• 冷却时长：`{int(SUPPRESS_SEC)}` 秒\n"
+        f"• 批次窗口：`{BATCH_WINDOW_SEC:g}` 秒（最后一条消息后）\n"
+        f"• 最长等待：`{BATCH_MAX_WAIT_SEC:g}` 秒（从批次第一条算起）\n\n"
+        f"**冷却提示**：{notice}（每个冷却窗口只回一次）\n"
+        f"提示语：`{SUPPRESS_NOTICE_TEXT}`\n\n"
+        "点击下方数值可修改（冷却/窗口单位：秒）。"
+    )
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🏷 昵称检测：{'关闭' if NAME_CHECK_ENABLED else '开启'}",
+                              callback_data="antispam_name_toggle")],
+        [InlineKeyboardButton(f"🔘 冷却抑制：{'关闭' if SUPPRESS_ENABLED else '开启'}",
+                              callback_data="antispam_toggle")],
+        [InlineKeyboardButton(f"⏱ 冷却时长：{int(SUPPRESS_SEC)}s",
+                              callback_data="antispam_edit:suppress_sec")],
+        [InlineKeyboardButton(f"🪟 批次窗口：{BATCH_WINDOW_SEC:g}s",
+                              callback_data="antispam_edit:batch_window_sec")],
+        [InlineKeyboardButton(f"⌛ 最长等待：{BATCH_MAX_WAIT_SEC:g}s",
+                              callback_data="antispam_edit:batch_max_wait_sec")],
+        [InlineKeyboardButton(f"💬 冷却提示：{'关闭' if SUPPRESS_NOTICE_ENABLED else '开启'}",
+                              callback_data="antispam_notice_toggle")],
+        [InlineKeyboardButton("✏️ 编辑提示语", callback_data="antispam_edit:suppress_notice_text")],
+        [InlineKeyboardButton("↩ 返回设置", callback_data="settings")],
+    ])
+    return text, markup
+
+
+def _ver_tuple(v: str) -> tuple:
+    """'v1.10.0' → (1, 10, 0). Used for version comparison in the update panel."""
+    parts = []
+    for chunk in str(v).strip().lstrip("vV").split("."):
+        num = ""
+        for ch in chunk:
+            if ch.isdigit():
+                num += ch
+            else:
+                break
+        parts.append(int(num) if num else 0)
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts[:3])
 
 
 def build_update_panel(latest_info: dict | None = None, checking: bool = False, error: str = ""):
@@ -1402,7 +1656,8 @@ def build_update_panel(latest_info: dict | None = None, checking: bool = False, 
     tag = latest_info.get("tag_name", "")
     latest_ver = tag.lstrip("v")
     body = (latest_info.get("body") or "（无更新说明）")[:800]
-    is_newer = latest_ver != __version__
+    latest_t, cur_t = _ver_tuple(latest_ver), _ver_tuple(__version__)
+    is_newer = latest_t > cur_t
 
     if is_newer:
         text = (
@@ -1422,6 +1677,13 @@ def build_update_panel(latest_info: dict | None = None, checking: bool = False, 
             f"当前版本：v{__version__}\n"
             f"✅ 已是最新版本（{tag}）"
         )
+        if latest_t < cur_t:
+            text = (
+                "🔄 **检查更新**\n\n"
+                f"当前版本：v{__version__}\n"
+                f"最新发布版：{tag}\n\n"
+                "✅ 本地版本比线上发布版更新（开发版），无需升级。"
+            )
         markup = InlineKeyboardMarkup([
             [InlineKeyboardButton("↩ 返回设置", callback_data="settings")],
         ])
@@ -1980,8 +2242,12 @@ def build_abuse_history(uid: int):
         lines = [f"📝 **{name}** ({uid}) 屏蔽记录\n"]
         for i, entry in enumerate(reversed(hist), 1):
             kind = entry.get("type", "??")
-            icon = "🚫" if kind == "abuse" else "🟡"
-            label_text = "脏话" if kind == "abuse" else "广告"
+            if kind == "nickname":
+                icon, label_text = "🏷", "昵称广告"
+            elif kind == "abuse":
+                icon, label_text = "🚫", "脏话"
+            else:
+                icon, label_text = "🟡", "广告"
             t = to_local_time(entry.get("time", ""), UTC_OFFSET)
             content = entry.get("text", "")[:150]
             matched = entry.get("matched", [])
@@ -2119,6 +2385,54 @@ async def handle_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(btns), parse_mode="Markdown")
         return
 
+    # === Anti-spam numeric input mode ===
+    if uid in antispam_edit_waiting:
+        key = antispam_edit_waiting.pop(uid)
+        raw = msg.text.strip()
+        if raw in ("/cancel", "取消"):
+            await msg.reply_text("✅ 已取消修改")
+            return
+        if key == "suppress_notice_text":
+            if not raw:
+                await msg.reply_text("❌ 提示文字不能为空")
+                return
+            global SUPPRESS_NOTICE_TEXT
+            cfg["suppress_notice_text"] = raw
+            save_config(cfg)
+            SUPPRESS_NOTICE_TEXT = raw
+            content, markup = build_antispam_panel()
+            await msg.reply_text("✅ 冷却提示语已更新\n\n" + content,
+                                 reply_markup=markup, parse_mode="Markdown")
+            logger.info("Owner updated anti-spam suppress_notice_text")
+            return
+        try:
+            val = float(raw)
+        except ValueError:
+            await msg.reply_text("❌ 请输入数字（秒），例如 `300`", parse_mode="Markdown")
+            return
+        if val < 0:
+            await msg.reply_text("❌ 不能为负数")
+            return
+        if key in ("batch_window_sec", "batch_max_wait_sec") and val < 1:
+            await msg.reply_text("❌ 至少 1 秒")
+            return
+        global SUPPRESS_SEC, BATCH_WINDOW_SEC, BATCH_MAX_WAIT_SEC
+        labels = {"suppress_sec": "冷却时长", "batch_window_sec": "批次窗口",
+                  "batch_max_wait_sec": "最长等待"}
+        cfg[key] = val
+        save_config(cfg)
+        if key == "suppress_sec":
+            SUPPRESS_SEC = val
+        elif key == "batch_window_sec":
+            BATCH_WINDOW_SEC = val
+        elif key == "batch_max_wait_sec":
+            BATCH_MAX_WAIT_SEC = val
+        content, markup = build_antispam_panel()
+        await msg.reply_text(f"✅ {labels.get(key, key)} 已更新为 {val:g} 秒\n\n" + content,
+                             reply_markup=markup, parse_mode="Markdown")
+        logger.info(f"Owner updated anti-spam {key} = {val}")
+        return
+
     # === AI model name input mode ===
     if uid in ai_model_waiting:
         mode = ai_model_waiting.pop(uid)
@@ -2252,6 +2566,8 @@ ai_setkey_waiting: set[int] = set()
 ai_setkey_platform: dict[int, str] = {}
 # Track which owner is waiting for AI model name input
 ai_model_waiting: dict[int, str] = {}  # uid -> "classify_model" | "insult_model"
+# Track which owner is editing an anti-spam numeric setting
+antispam_edit_waiting: dict[int, str] = {}  # uid -> config key
 # (OR_SNAPSHOT / OR_PENDING are declared with the OpenRouter discovery helpers)
 
 
@@ -2259,6 +2575,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle all inline button callbacks from owner."""
     global AI_ABUSE_MANUAL_OFF, AI_ENABLED, cfg, _last_ai_check, ai_setkey_waiting, ai_setkey_platform
     global CLASSIFY_MODEL, INSULT_MODEL, AI_BASE_URL, AI_PLATFORM
+    global SUPPRESS_ENABLED, SUPPRESS_SEC, BATCH_WINDOW_SEC, BATCH_MAX_WAIT_SEC
+    global SUPPRESS_NOTICE_ENABLED, SUPPRESS_NOTICE_TEXT
+    global NAME_CHECK_ENABLED
     query = update.callback_query
     logger.info(f"Callback query received: data={query.data}, from={query.from_user.id}")
 
@@ -2343,6 +2662,65 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "settings":
         content, markup = build_settings_menu()
         await edit(content, markup)
+        return
+
+    # --- Anti-spam settings ---
+    if data == "antispam":
+        antispam_edit_waiting.pop(chat_id, None)
+        content, markup = build_antispam_panel()
+        await edit(content, markup)
+        return
+
+    if data == "antispam_toggle":
+        SUPPRESS_ENABLED = not SUPPRESS_ENABLED
+        cfg["suppress_enabled"] = SUPPRESS_ENABLED
+        save_config(cfg)
+        await query.answer(f"冷却抑制已{'开启' if SUPPRESS_ENABLED else '关闭'}")
+        content, markup = build_antispam_panel()
+        await edit(content, markup)
+        logger.info(f"Owner toggled suppress_enabled = {SUPPRESS_ENABLED}")
+        return
+
+    if data == "antispam_name_toggle":
+        NAME_CHECK_ENABLED = not NAME_CHECK_ENABLED
+        cfg["name_check_enabled"] = NAME_CHECK_ENABLED
+        save_config(cfg)
+        await query.answer(f"昵称检测已{'开启' if NAME_CHECK_ENABLED else '关闭'}")
+        content, markup = build_antispam_panel()
+        await edit(content, markup)
+        logger.info(f"Owner toggled name_check_enabled = {NAME_CHECK_ENABLED}")
+        return
+
+    if data == "antispam_notice_toggle":
+        SUPPRESS_NOTICE_ENABLED = not SUPPRESS_NOTICE_ENABLED
+        cfg["suppress_notice_enabled"] = SUPPRESS_NOTICE_ENABLED
+        save_config(cfg)
+        await query.answer(f"冷却提示已{'开启' if SUPPRESS_NOTICE_ENABLED else '关闭'}")
+        content, markup = build_antispam_panel()
+        await edit(content, markup)
+        logger.info(f"Owner toggled suppress_notice_enabled = {SUPPRESS_NOTICE_ENABLED}")
+        return
+
+    if data.startswith("antispam_edit:"):
+        key = data.split(":", 1)[1]
+        if key not in ("suppress_sec", "batch_window_sec", "batch_max_wait_sec",
+                       "suppress_notice_text"):
+            await query.answer("未知设置项")
+            return
+        antispam_edit_waiting[chat_id] = key
+        label = {"suppress_sec": "冷却时长", "batch_window_sec": "批次窗口",
+                 "batch_max_wait_sec": "最长等待",
+                 "suppress_notice_text": "冷却提示语"}[key]
+        await query.answer()
+        if key == "suppress_notice_text":
+            hint = (f"🛡️ **{label}**\n\n请直接发送新的提示文字（单行）。\n"
+                    f"当前：`{SUPPRESS_NOTICE_TEXT}`\n发送 /cancel 取消。")
+        else:
+            hint = f"🛡️ **{label}**\n\n请直接发送新的数值（单位：秒）。\n发送 /cancel 取消。"
+        await edit(
+            hint,
+            InlineKeyboardMarkup([[InlineKeyboardButton("❌ 取消", callback_data="antispam")]])
+        )
         return
 
     # --- Timezone settings ---

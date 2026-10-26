@@ -30,8 +30,12 @@ backup/
 # 临时和本地开发文件
 *.backup
 *.gitbak
+forwarder.py.bak-*
 _apply_patches.py
 forwarder_patched.py
+# 运行时产物
+forwarder.*.pid
+reply_map.json
 
 # 轮转后的日志（logrotate 产物，勿入库）
 *.log-*
