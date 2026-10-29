@@ -14,7 +14,7 @@ Features:
 - Blocked user management, auto-reply, keyword management
 """
 
-__version__ = "1.10.0"
+__version__ = "1.10.1"
 
 import asyncio, json, logging, os, re, signal, sys, time, unicodedata
 import httpx
@@ -74,6 +74,9 @@ SUPPRESS_NOTICE_TEXT = cfg.get(
     "suppress_notice_text",
     "⏳ 你已被暂时限制，冷却期内的消息不会被转发给管理员。"
 )
+# AI 只做提示：分类结果不再单独决定拦截，只给转发消息加标记。
+# ai_fail_tag=True 时，分类器不可用（404/超时/空回复）会在转发上加「未AI审查」标记。
+AI_FAIL_TAG_ENABLED = bool(cfg.get("ai_fail_tag", True))
 
 # === Nickname / username ad detection (ads hidden in display names) ===
 # Spammers send harmless text ("你好") and put the ad in their display name.
@@ -543,6 +546,9 @@ NAME_EXTRA_SPAM_KW = (
     "代理", "招代", "招商加盟", "加盟", "一件代发", "货源", "批发", "低价", "秒杀", "清仓",
     "看我资料", "看签名", "点我头像", "主页有", "私我", "滴滴我", "戳我", "找我聊",
     "薇信", "徽信", "威信", "威心", "加薇", "伽薇", "茄薇", "加徽", "微我", "私信我",
+    # 黑灰产昵称高信号词（只用于昵称判断，不参与正文匹配）：跑分/代收/发票/刷单类
+    "代收", "代付", "出款", "收款码", "跑分", "卡商", "收卡", "刷单", "日赚",
+    "开发票", "代开", "发票", "开票", "点位", "对接", "理财", "兼职", "洗钱", "换汇",
 )
 
 # Cloud keywords that are too generic to judge a *display name* on
@@ -763,7 +769,8 @@ async def send_msg(chat_id: int, text: str, reply_to_message_id: int = 0) -> boo
 
 
 async def forward_to_owner(uid: int, name: str, username: str, text: str,
-                              spam_count: int = 0, abuse_count: int = 0) -> int:
+                              spam_count: int = 0, abuse_count: int = 0,
+                              notes: list[str] | None = None) -> int:
     """Forward legit message. Returns Telegram message_id or 0 on failure."""
     # Escape Markdown special chars in user-supplied text to avoid 400 errors
     md_escape = str.maketrans({c: f"\\{c}" for c in "_*[]()~`>#+-=|{}.!"})
@@ -774,6 +781,7 @@ async def forward_to_owner(uid: int, name: str, username: str, text: str,
         tags.append(f"🛡️广告×{spam_count}")
     if abuse_count > 0:
         tags.append(f"🤬脏话×{abuse_count}")
+    tags.extend(notes or [])
     tag_line = " " + " ".join(tags) if tags else ""
     msg = f"📩 **{name}**{uname}\n🆔 `{uid}`{tag_line}\n\n{safe_text}"
     try:
@@ -855,15 +863,38 @@ def _is_suppressed(us: dict) -> bool:
         return False
 
 
-async def ai_classify_batch(messages: list[dict], profile: str = "") -> tuple[dict[int, str], str]:
-    """Batch AI classify: returns ({index: label}, overall_label).
-    
+def _purge_pending_queue(uid: int, reason: str = "") -> int:
+    """Drop a user's queued-but-not-yet-flushed messages. Returns how many were dropped.
+
+    Needed because spammers send filler first ("哥") and the ad seconds later: the
+    filler sits in the debounce queue, the ad gets caught locally, and without this
+    purge the filler is still forwarded when the timer fires.
+    """
+    entry = _pending_queues.pop(uid, None)
+    if not entry:
+        return 0
+    task = entry.get("timer_task")
+    if task and not task.done():
+        task.cancel()
+    n = len(entry.get("messages") or [])
+    if n:
+        logger.info(f"Pending batch PURGED for user {uid}: {n} msg dropped ({reason or 'no reason'})")
+    return n
+
+
+async def ai_classify_batch(messages: list[dict], profile: str = "") -> tuple[dict[int, str], str, bool]:
+    """Batch AI classify: returns ({index: label}, overall_label, ok).
+
     Sends all messages together for context-aware per-message + overall judgement.
     profile: optional "昵称：X 用户名：@Y" line — name ads count as SPAM even when
     the message text is harmless ("你好").
+
+    ok=False means the classifier did not produce a usable verdict (HTTP error,
+    timeout, empty/truncated answer). Callers MUST NOT treat that as "all OK":
+    a dead classifier used to silently pass every batch.
     """
     if not messages:
-        return ({}, "OK")
+        return ({}, "OK", True)
 
     profile_block = f"用户资料：{profile}\n\n" if profile else ""
     # Build prompt with numbered messages
@@ -888,29 +919,44 @@ async def ai_classify_batch(messages: list[dict], profile: str = "") -> tuple[di
 OVERALL:SPAM"""
 
     try:
-        async with httpx.AsyncClient(timeout=20) as c:
+        async with httpx.AsyncClient(timeout=25) as c:
             r = await c.post(
                 f"{AI_BASE_URL}/chat/completions",
                 headers={"Authorization": f"Bearer {AI_API_KEY}"},
                 json={
                     "model": CLASSIFY_MODEL,
                     "messages": [
-                        {"role": "system", "content": "你是一个消息分类器。必须严格按照要求的格式回复。"},
+                        {"role": "system", "content": "你是一个消息分类器。必须严格按照要求的格式回复，不要输出任何解释。"},
                         {"role": "user", "content": prompt}
                     ],
-                    "max_tokens": 200,
+                    # Reasoning models burn the budget on hidden reasoning and return
+                    # empty content at 200 tokens — which used to parse as "all OK".
+                    "max_tokens": 900,
                     "temperature": 0
                 }
             )
             if r.status_code == 200:
-                ans = r.json()["choices"][0]["message"]["content"].strip()
-                return _parse_batch_result(ans, len(messages))
+                ans = (r.json()["choices"][0]["message"].get("content") or "").strip()
+                if not ans:
+                    logger.warning(
+                        f"AI batch classify returned empty content (model={CLASSIFY_MODEL}) "
+                        f"→ verdict unavailable")
+                    return ({}, "OK", False)
+                labels, overall = _parse_batch_result(ans, len(messages))
+                return (labels, overall, True)
             elif r.status_code in (401, 403):
                 logger.error(f"AI batch classify token invalid (HTTP {r.status_code}), disabling AI")
                 await _disable_ai_due_to_auth()
+            else:
+                body = ""
+                try:
+                    body = (r.json().get("error") or {}).get("message", "")
+                except Exception:
+                    body = r.text[:200]
+                logger.error(f"AI batch classify HTTP {r.status_code}: {body}")
     except Exception as e:
-        logger.error(f"AI batch classify error: {e}")
-    return ({}, "OK")
+        logger.error(f"AI batch classify error: {type(e).__name__}: {e}")
+    return ({}, "OK", False)
 
 
 def _parse_batch_result(answer: str, count: int) -> tuple[dict[int, str], str]:
@@ -978,10 +1024,19 @@ async def _flush_pending_queue(uid: int):
         logger.info(f"Batch for user {uid}: blocked (local ≥2), spam_count={spam_c}")
         return
 
+    # === 冷却期内直接丢弃整批（P0） ===
+    # 场景：骗子先发「哥」，几秒后甩广告。广告被本地词库命中 → 该用户进入冷却，
+    # 但先排队的那条消息还在队列里，冷却前出队会被当正常消息转出去。
+    if not us.get("approved") and _is_suppressed(us):
+        for m in msgs:
+            logger.info(f"Batch for user {uid}: dropped (cooldown active) {m['text'][:40]!r}")
+        logger.info(f"Batch for user {uid}: dropped all {len(msgs)} msg (cooldown active)")
+        return
+
     # Need AI for remaining messages (only classify MAYBE/OK ones)
-    ai_hit_count = 0
     ai_labels: dict[int, str] = {}
     overall = "OK"
+    ai_ok = True
     to_classify = [m for m in msgs if m["local"] in ("MAYBE", "OK")]
 
     # Display name context: ads in the nickname count as SPAM even for "你好"
@@ -994,63 +1049,46 @@ async def _flush_pending_queue(uid: int):
     profile = "，".join(profile_bits)
 
     if AI_ENABLED and to_classify:
-        batch_labels, overall = await ai_classify_batch(to_classify, profile)
+        batch_labels, overall, ai_ok = await ai_classify_batch(to_classify, profile)
         # Map batch indices back to original message indices
         for bi, label in batch_labels.items():
-            if label in ("SPAM", "ABUSE"):
-                # Find the original index of the bi-th message in to_classify
-                if bi < len(to_classify):
-                    tc_msg = to_classify[bi]
-                    # Find this message in msgs
-                    for oi, om in enumerate(msgs):
-                        if om is tc_msg:
-                            ai_labels[oi] = label
-                            break
-                    ai_hit_count += 1
+            if label in ("SPAM", "ABUSE") and bi < len(to_classify):
+                tc_msg = to_classify[bi]
+                for oi, om in enumerate(msgs):
+                    if om is tc_msg:
+                        ai_labels[oi] = label
+                        break
 
-    total_hits = local_hit_count + ai_hit_count
+    # === AI 只做提示，不再单独拦截 ===
+    # 实测免费/廉价分类器会漏判昵称广告、把「我电话186…」误判成 SPAM，让它单独
+    # 决定拦截会误伤真实学员。拦截只由本地词库 + 昵称检测决定，AI 结果只加标记。
+    notes: list[str] = []
+    if AI_ENABLED and to_classify:
+        if not ai_ok:
+            logger.warning(f"Batch for user {uid}: AI verdict unavailable → 未AI审查 tag")
+            if AI_FAIL_TAG_ENABLED:
+                notes.append("⚠️未AI审查")
+        elif ai_labels or overall == "SPAM":
+            detail = "/".join(sorted({v for v in ai_labels.values()})) or "OVERALL"
+            logger.info(f"Batch for user {uid}: AI suspects {detail} (overall={overall}) "
+                        f"→ advisory tag only, not blocking")
+            notes.append(f"⚠️AI疑似广告({detail})")
 
-    if overall == "SPAM" or total_hits >= 2:
-        # === Block entire batch ===
-        logger.info(f"Batch for user {uid}: overall={overall}, total_hits={total_hits} → block all")
-        for _, m in local_spam_abuse:
-            await record_blocked_content(uid, m["text"], m["local"].lower(), m.get("matched"))
-        for oi, label in ai_labels.items():
-            await record_blocked_content(uid, msgs[oi]["text"], label.lower(), ["AI"])
-        if not local_spam_abuse and not ai_labels:
-            # AI flagged the batch only because of the display name
-            await record_blocked_content(uid, f"[昵称] {profile}", "nickname", ["AI"])
-        spam_c += total_hits
-        stats_add("ads_blocked", max(1, total_hits))
-        update_kw = {"spam_count": spam_c, "blocked": True,
-                     "suppress_until": _suppress_until_ts(),
-                     "last_active": now, "last_msg_time": now, "msgs_checked": 0}
-        await send_msg(uid, "滚吧，广告狗，你已被拉黑。")
-        await state.update(uid, **update_kw)
-        logger.info(f"Batch for user {uid}: blocked (AI), spam_count={spam_c}")
-        return
-
-    if total_hits == 1:
-        # === Single hit: suppress the WHOLE batch ===
+    if local_hit_count == 1:
+        # === Single local hit: suppress the WHOLE batch ===
         # Spammers often follow an ad with filler ("打扰了"); do not forward the rest.
-        hit_idx = None
-        if local_spam_abuse:
-            hit_idx = local_spam_abuse[0][0]
-        elif ai_labels:
-            hit_idx = next(iter(ai_labels))
+        hit_idx, hit_msg = local_spam_abuse[0]
+        await record_blocked_content(uid, hit_msg["text"], hit_msg["local"].lower(),
+                                     hit_msg.get("matched"))
 
-        hit_label = (local_spam_abuse[0][1]["local"] if local_spam_abuse
-                     else ai_labels[hit_idx]).lower()
-        await record_blocked_content(uid, msgs[hit_idx]["text"], hit_label,
-                                     msgs[hit_idx].get("matched") or ["AI"])
-
-        spam_c = await apply_spam_hit(uid, spam_c, now, msgs[hit_idx]["msg_id"], source="text")
-        logger.info(f"Batch for user {uid}: 1 hit → whole batch suppressed "
+        spam_c = await apply_spam_hit(uid, spam_c, now, hit_msg["msg_id"], source="text")
+        logger.info(f"Batch for user {uid}: 1 local hit → whole batch suppressed "
                     f"(dropped {max(0, len(msgs) - 1)} non-hit msg), spam_count={spam_c}")
         return
 
-    # === 0 hits: forward all ===
-    logger.info(f"Batch for user {uid}: 0 hits → forward all")
+    # === 0 local hits: forward all（AI 提示随消息一起带上） ===
+    logger.info(f"Batch for user {uid}: 0 local hits → forward all"
+                + (f", notes={notes}" if notes else ""))
     checked = us.get("msgs_checked", 0) + len(msgs)
     update_kw = {"msgs_checked": checked, "spam_count": spam_c, "abuse_count": 0,
                  "last_active": now, "last_msg_time": now}
@@ -1062,7 +1100,7 @@ async def _flush_pending_queue(uid: int):
     last_fwd_id = 0
     for m in msgs:
         fwd_id = await forward_to_owner(uid, m.get("full_name", ""), m.get("username", ""),
-                                        m["text"], spam_c, 0)
+                                        m["text"], spam_c, 0, notes)
         if fwd_id:
             last_fwd_id = fwd_id
         logger.info(f"Batch for user {uid}: msg → forwarded")
@@ -1110,10 +1148,10 @@ async def _schedule_batch_flush(uid: int, delay: float | None = None):
         _pending_queues[uid]["timer_task"] = task
 
 
-SPAM_ESCALATION_TEXT = ("请勿发送广告。", "请注意言辞，再发广告将被拉黑。", "你已被拉黑，滚吧。")
+SPAM_BLOCK_AT = 2  # 第 2 次广告命中直接拉黑（原来是第 3 次）
+SPAM_ESCALATION_TEXT = ("请勿发送广告，再发一次将被拉黑。", "你已被拉黑，滚吧。")
 NAME_ESCALATION_TEXT = (
     NAME_NOTICE_TEXT,
-    "⚠️ 警告：昵称/用户名仍是广告内容，再发一次将拉黑。",
     "你已被拉黑，滚吧。",
 )
 
@@ -1130,12 +1168,15 @@ async def apply_spam_hit(uid: int, spam_c: int, now: str, reply_to_msg_id: int =
     update_kw = {"spam_count": spam_c, "suppress_until": _suppress_until_ts(),
                  "last_active": now, "last_msg_time": now, "msgs_checked": 0}
     texts = NAME_ESCALATION_TEXT if source == "name" else SPAM_ESCALATION_TEXT
-    if spam_c >= 3:
+    if spam_c >= SPAM_BLOCK_AT:
         update_kw["blocked"] = True
-        await send_msg(uid, texts[2], reply_to_message_id=reply_to_msg_id)
+        await send_msg(uid, texts[-1], reply_to_message_id=reply_to_msg_id)
     else:
-        await send_msg(uid, texts[spam_c - 1], reply_to_message_id=reply_to_msg_id)
+        await send_msg(uid, texts[0], reply_to_message_id=reply_to_msg_id)
     await state.update(uid, **update_kw)
+    # 命中广告的瞬间就清空该用户的待转发队列：骗子常先发闲聊再甩广告，排在前面的
+    # 闲聊不能因为在冷却开始前排进队列而被转出去。
+    _purge_pending_queue(uid, f"{source} spam hit #{spam_c}")
     return spam_c
 
 

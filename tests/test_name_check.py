@@ -73,6 +73,12 @@ SPAM_CASES = [
     ("天天秒杀", None),
     ("招代 私我", None),
     ("私信我领资料", None),
+    # 黑灰产高信号昵称（跑分/代收/发票/刷单类，只用于昵称判断）
+    ("代收业务经理 阿强", None),
+    ("点位对接 阿强", "dcds77"),
+    ("财务代开发票", None),
+    ("跑分刷单 长期稳定", None),
+    ("兼职日赚300 带单", None),
 ]
 
 # Real students / teachers — MUST NOT be flagged
@@ -97,6 +103,9 @@ OK_CASES = [
     ("爱钓鱼的小张", "zhang_fishing"),
     ("南山琴行 王老师", None),
     ("英语培训 小刘", None),
+    ("吉他维修 老李", None),
+    ("门店店长 小陈", None),
+    ("送货师傅 老赵", None),
 ]
 
 

@@ -89,8 +89,8 @@ async def fake_send_msg(chat_id, text, reply_to_message_id=0):
     return True
 
 
-async def fake_forward_to_owner(uid, full_name, username, text, spam_c, abuse_c):
-    forwarded.append({"uid": uid, "name": full_name, "text": text})
+async def fake_forward_to_owner(uid, full_name, username, text, spam_c=0, abuse_c=0, notes=None):
+    forwarded.append({"uid": uid, "name": full_name, "text": text, "notes": list(notes or [])})
     return 999
 
 
@@ -170,6 +170,26 @@ async def run():
     us = fw.state.get(555)
     if us.get("spam_count") != 1 or forwarded:
         fails.append(f"6: username ad not caught (spam_count={us.get('spam_count')}, fwd={forwarded})")
+
+    # --- 7. 第一次广告只警告，不拉黑 ---
+    install_stubs()
+    await fw.handle_stranger(make_update(666, "小明", "xiaoming", "加微 abc 推广"), None)
+    us = fw.state.get(666)
+    if us.get("spam_count") != 1 or us.get("blocked"):
+        fails.append(f"7: first hit should warn only, state={us}")
+    if not sent or sent[-1]["text"] != fw.SPAM_ESCALATION_TEXT[0]:
+        fails.append(f"7: first hit should send the plain warning, got {sent}")
+
+    # --- 8. 第二次广告直接拉黑（SPAM_BLOCK_AT=2） ---
+    install_stubs()
+    fw.state.users[777] = {"spam_count": 1, "approved": False, "blocked": False,
+                           "suppress_until": 0, "abuse_count": 0}
+    await fw.handle_stranger(make_update(777, "小明", "xiaoming", "加微 abc 推广"), None)
+    us = fw.state.get(777)
+    if not us.get("blocked"):
+        fails.append(f"8: second hit did not block, state={us}")
+    if not sent or "拉黑" not in sent[-1]["text"]:
+        fails.append(f"8: second hit should send the block notice, got {sent}")
 
     print(f"handler wiring checks, failures: {len(fails)}")
     for f in fails:
