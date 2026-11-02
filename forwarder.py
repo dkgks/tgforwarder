@@ -14,7 +14,7 @@ Features:
 - Blocked user management, auto-reply, keyword management
 """
 
-__version__ = "1.10.1"
+__version__ = "1.10.2"
 
 import asyncio, json, logging, os, re, signal, sys, time, unicodedata
 import httpx
@@ -803,6 +803,19 @@ async def forward_to_owner(uid: int, name: str, username: str, text: str,
     return 0
 
 
+async def notify_owner_ai_block(uid: int, name: str, username: str, detail: str,
+                                count: int, spam_count: int) -> None:
+    """Tell the owner a batch was blocked by the AI classifier (ad text NOT included)."""
+    uname = f" @{username}" if username else ""
+    who = f"{name or '未知用户'}{uname}"
+    nth = "已拉黑" if spam_count >= SPAM_BLOCK_AT else f"第 {spam_count} 次命中"
+    text = (f"🛡️ 已拦截疑似广告（AI 判定：{detail}）\n"
+            f"来自 {who}\n"
+            f"ID {uid} · 本批 {count} 条 · {nth}\n"
+            f"原文可在此用户的「📝 屏蔽记录」里查看")
+    await send_msg(OWNER_ID, text)
+
+
 async def tag_forwarded_message(fwd_msg_id: int, tag: str, original_text: str = ""):
     """Edit a forwarded message to append a tag at the end.
     If original_text is provided, appends tag to it. Otherwise sends a separate notification."""
@@ -1059,9 +1072,10 @@ async def _flush_pending_queue(uid: int):
                         ai_labels[oi] = label
                         break
 
-    # === AI 只做提示，不再单独拦截 ===
-    # 实测免费/廉价分类器会漏判昵称广告、把「我电话186…」误判成 SPAM，让它单独
-    # 决定拦截会误伤真实学员。拦截只由本地词库 + 昵称检测决定，AI 结果只加标记。
+    # === AI 判定广告 → 拦下，不转发 ===
+    # 本地词库对中文有效，但外文广告/变形写法完全命中不了（实测一条英文广告本地 0 命中，
+    # AI 判 SPAM）。AI 判定成立时按「一次广告命中」处理：不进主人的消息流，只留屏蔽记录。
+    # 给发送者不发警告（避免免费模型误判时吓到真实客户），但计入 spam_count，2 次即拉黑。
     notes: list[str] = []
     if AI_ENABLED and to_classify:
         if not ai_ok:
@@ -1070,9 +1084,17 @@ async def _flush_pending_queue(uid: int):
                 notes.append("⚠️未AI审查")
         elif ai_labels or overall == "SPAM":
             detail = "/".join(sorted({v for v in ai_labels.values()})) or "OVERALL"
-            logger.info(f"Batch for user {uid}: AI suspects {detail} (overall={overall}) "
-                        f"→ advisory tag only, not blocking")
-            notes.append(f"⚠️AI疑似广告({detail})")
+            for oi, label in ai_labels.items():
+                await record_blocked_content(uid, msgs[oi]["text"], "spam", ["AI:" + label])
+            if not ai_labels:
+                await record_blocked_content(uid, f"[昵称] {profile}", "nickname", ["AI:OVERALL"])
+            spam_c = await apply_spam_hit(uid, spam_c, now, msgs[0].get("msg_id", 0),
+                                          source="text", notify=False)
+            await notify_owner_ai_block(uid, first.get("full_name", ""),
+                                        first.get("username", ""), detail, len(msgs), spam_c)
+            logger.info(f"Batch for user {uid}: AI={detail} (local 0 hits) → blocked, "
+                        f"not forwarded, spam_count={spam_c}")
+            return
 
     if local_hit_count == 1:
         # === Single local hit: suppress the WHOLE batch ===
@@ -1157,10 +1179,13 @@ NAME_ESCALATION_TEXT = (
 
 
 async def apply_spam_hit(uid: int, spam_c: int, now: str, reply_to_msg_id: int = 0,
-                         source: str = "text") -> int:
-    """Shared SPAM escalation: warn → warn → block.
+                         source: str = "text", notify: bool = True) -> int:
+    """Shared SPAM escalation: warn at #1, block at SPAM_BLOCK_AT.
 
     source: "text" = ad in the message body, "name" = ad in the display name.
+    notify: False keeps the sender silent (AI-suspicion path — a false positive from a
+    weak classifier should not send a real customer an ad warning), but the hit still
+    counts toward SPAM_BLOCK_AT.
     Returns the updated spam_count.
     """
     spam_c += 1
@@ -1170,8 +1195,9 @@ async def apply_spam_hit(uid: int, spam_c: int, now: str, reply_to_msg_id: int =
     texts = NAME_ESCALATION_TEXT if source == "name" else SPAM_ESCALATION_TEXT
     if spam_c >= SPAM_BLOCK_AT:
         update_kw["blocked"] = True
-        await send_msg(uid, texts[-1], reply_to_message_id=reply_to_msg_id)
-    else:
+        if notify:
+            await send_msg(uid, texts[-1], reply_to_message_id=reply_to_msg_id)
+    elif notify:
         await send_msg(uid, texts[0], reply_to_message_id=reply_to_msg_id)
     await state.update(uid, **update_kw)
     # 命中广告的瞬间就清空该用户的待转发队列：骗子常先发闲聊再甩广告，排在前面的

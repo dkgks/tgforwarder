@@ -168,18 +168,32 @@ async def run():
     if not forwarded or forwarded[0]["notes"]:
         fails.append(f"4: fail-tag switch ignored: {forwarded}")
 
-    # --- 5. AI suspects spam → advisory tag, message still forwarded (no block) ---
+    # --- 5. AI 判 SPAM 而本地 0 命中（外文广告）→ 不转发，计入命中并通知主人 ---
     install_stubs(ai_labels={0: "SPAM"})
-    fw._pending_queues[605] = {"messages": [entry("你好")], "first_ts": time.time(),
-                               "timer_task": None}
+    fw._pending_queues[605] = {"messages": [entry("Buy cheap USDT now, DM me")],
+                               "first_ts": time.time(), "timer_task": None}
     await fw._flush_pending_queue(605)
-    if len(forwarded) != 1:
-        fails.append(f"5: advisory suspect should not block: {forwarded}")
-    elif not any("AI疑似广告" in n for n in forwarded[0]["notes"]):
-        fails.append(f"5: missing advisory tag: {forwarded[0]}")
+    if forwarded:
+        fails.append(f"5: AI-flagged ad was forwarded to the owner: {forwarded}")
     us = fw.state.get(605)
-    if us.get("blocked"):
-        fails.append("5: AI alone blocked the user")
+    if us.get("spam_count") != 1:
+        fails.append(f"5: AI hit not counted, spam_count={us.get('spam_count')}")
+    if us.get("approved"):
+        fails.append("5: AI-flagged user must not count toward approval")
+    if not any("已拦截疑似广告" in s for s in sent):
+        fails.append(f"5: owner was not notified about the AI block: {sent}")
+
+    # --- 5b. AI 判定 + 第二次命中 → 直接拉黑 ---
+    install_stubs(ai_labels={0: "SPAM"})
+    fw.state.users[610] = {"approved": False, "blocked": False, "spam_count": 1,
+                           "suppress_until": 0, "abuse_count": 0}
+    fw._pending_queues[610] = {"messages": [entry("cheap followers, dm")],
+                               "first_ts": time.time(), "timer_task": None}
+    await fw._flush_pending_queue(610)
+    if forwarded:
+        fails.append(f"5b: second AI hit was forwarded: {forwarded}")
+    if not fw.state.get(610).get("blocked"):
+        fails.append(f"5b: second AI hit must block, state={fw.state.get(610)}")
 
     # --- 6. One local hit in a batch → whole batch dropped, warning sent ---
     install_stubs(ai_enabled=False)
