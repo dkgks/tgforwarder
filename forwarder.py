@@ -14,7 +14,7 @@ Features:
 - Blocked user management, auto-reply, keyword management
 """
 
-__version__ = "1.10.2"
+__version__ = "1.10.3"
 
 import asyncio, json, logging, os, re, signal, sys, time, unicodedata
 import httpx
@@ -74,9 +74,13 @@ SUPPRESS_NOTICE_TEXT = cfg.get(
     "suppress_notice_text",
     "⏳ 你已被暂时限制，冷却期内的消息不会被转发给管理员。"
 )
-# AI 只做提示：分类结果不再单独决定拦截，只给转发消息加标记。
-# ai_fail_tag=True 时，分类器不可用（404/超时/空回复）会在转发上加「未AI审查」标记。
-AI_FAIL_TAG_ENABLED = bool(cfg.get("ai_fail_tag", True))
+# AI 分类结果只做判定依据 + 标记：AI 判 SPAM 时拦下，AI 不可用时暂扣待主人放行。
+# AI 分类模型链：主模型失败/返回空内容时依次尝试后面的模型。
+CLASSIFY_MAX_TOKENS = int(cfg.get("ai", {}).get("classify_max_tokens", 3000) or 3000)
+CLASSIFY_MODELS = [m for m in (cfg.get("ai", {}).get("classify_models") or []) if m]
+if not CLASSIFY_MODELS:
+    CLASSIFY_MODELS = [cfg.get("ai", {}).get("classify_model",
+                                             "qwen/qwen3-next-80b-a3b-instruct:free")]
 
 # === Nickname / username ad detection (ads hidden in display names) ===
 # Spammers send harmless text ("你好") and put the ad in their display name.
@@ -816,6 +820,87 @@ async def notify_owner_ai_block(uid: int, name: str, username: str, detail: str,
     await send_msg(OWNER_ID, text)
 
 
+async def send_owner_buttons(text: str, markup) -> int:
+    """Send the owner a plain-text notice with an inline keyboard. Returns message_id."""
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.post(
+                f"https://api.telegram.org/bot{NEW_BOT_TOKEN}/sendMessage",
+                json={"chat_id": OWNER_ID, "text": text, "reply_markup": markup.to_dict()}
+            )
+            if r.status_code == 200 and r.json().get("ok"):
+                return r.json()["result"]["message_id"]
+            logger.warning(f"send_owner_buttons failed: {r.text[:200]}")
+    except Exception as e:
+        logger.error(f"send_owner_buttons error: {e}")
+    return 0
+
+
+# 分类器不可用时暂扣的消息：token → {uid, name, username, texts, ts}
+# 不转发、不入消息流，等主人在通知里点「放行 / 丢弃」。
+_held_messages: dict[str, dict] = {}
+
+
+def _new_held_token(uid: int) -> str:
+    return f"{uid}-{int(time.time() * 1000) % 10_000_000}"
+
+
+def _build_held_notice(entry: dict) -> tuple[str, InlineKeyboardMarkup]:
+    uname = f" @{entry['username']}" if entry.get("username") else ""
+    who = f"{entry.get('name') or '未知用户'}{uname}"
+    body = "\n———\n".join(t[:600] for t in entry["texts"])
+    text = (f"⏳ AI 审核不可用，已暂扣 {len(entry['texts'])} 条消息（未转发）\n"
+            f"来自 {who}\nID {entry['uid']}\n\n{body}")
+    markup = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ 放行", callback_data=f"held_rel_{entry['token']}"),
+        InlineKeyboardButton("🚫 丢弃", callback_data=f"held_drop_{entry['token']}"),
+    ]])
+    return text, markup
+
+
+async def hold_for_owner_review(uid: int, name: str, username: str,
+                                msgs: list[dict]) -> str:
+    """暂扣一批消息等主人决定：AI 审核不可用时不猜、不放过。返回 token。"""
+    token = _new_held_token(uid)
+    entry = {"token": token, "uid": uid, "name": name, "username": username,
+             "texts": [m["text"] for m in msgs], "ts": time.time()}
+    _held_messages[token] = entry
+    for m in msgs:
+        await record_blocked_content(uid, m["text"], "held", ["AI_UNREVIEWED"])
+    text, markup = _build_held_notice(entry)
+    await send_owner_buttons(text, markup)
+    logger.info(f"Batch for user {uid}: AI unavailable → {len(msgs)} msg held for review "
+                f"(token={token})")
+    return token
+
+
+async def release_held(token: str) -> int:
+    """主人点「放行」：把暂扣的消息转发出去。返回转发条数。"""
+    entry = _held_messages.pop(token, None)
+    if not entry:
+        return -1
+    n = 0
+    for text in entry["texts"]:
+        if await forward_to_owner(entry["uid"], entry.get("name", ""),
+                                  entry.get("username", ""), text, 0, 0, ["✅人工放行"]):
+            n += 1
+    logger.info(f"Held messages released by owner: {n}/{len(entry['texts'])} "
+                f"(user {entry['uid']}, token={token})")
+    return n
+
+
+async def drop_held(token: str) -> bool:
+    """主人点「丢弃」：按一次广告命中处理（静默计数，第 2 次拉黑）。"""
+    entry = _held_messages.pop(token, None)
+    if not entry:
+        return False
+    us = await state.ensure_user(entry["uid"], "", "")
+    await apply_spam_hit(entry["uid"], us.get("spam_count", 0), datetime_iso(),
+                         source="text", notify=False)
+    logger.info(f"Held messages dropped by owner (user {entry['uid']}, token={token})")
+    return True
+
+
 async def tag_forwarded_message(fwd_msg_id: int, tag: str, original_text: str = ""):
     """Edit a forwarded message to append a tag at the end.
     If original_text is provided, appends tag to it. Otherwise sends a separate notification."""
@@ -931,45 +1016,59 @@ async def ai_classify_batch(messages: list[dict], profile: str = "") -> tuple[di
 1:SPAM, 2:OK, 3:SPAM
 OVERALL:SPAM"""
 
+    for model in CLASSIFY_MODELS:
+        ans = await _ai_classify_once(model, prompt)
+        if ans:
+            labels, overall = _parse_batch_result(ans, len(messages))
+            return (labels, overall, True)
+        if not AI_ENABLED:  # token 失效已被 _disable_ai_due_to_auth 关掉，别再打
+            break
+    logger.error(f"AI batch classify: all models failed "
+                 f"({', '.join(CLASSIFY_MODELS)}) → verdict unavailable")
+    return ({}, "OK", False)
+
+
+async def _ai_classify_once(model: str, prompt: str) -> str:
+    """One classify attempt. Returns the raw answer, or "" when unusable.
+
+    推理型模型会把 max_tokens 全花在隐藏 reasoning 上，content 返回空字符串——这正是
+    v1.10.2 里「空内容」漏广告的原因。所以 max_tokens 给足（CLASSIFY_MAX_TOKENS）。
+    """
     try:
-        async with httpx.AsyncClient(timeout=25) as c:
+        async with httpx.AsyncClient(timeout=30) as c:
             r = await c.post(
                 f"{AI_BASE_URL}/chat/completions",
                 headers={"Authorization": f"Bearer {AI_API_KEY}"},
                 json={
-                    "model": CLASSIFY_MODEL,
+                    "model": model,
                     "messages": [
                         {"role": "system", "content": "你是一个消息分类器。必须严格按照要求的格式回复，不要输出任何解释。"},
                         {"role": "user", "content": prompt}
                     ],
-                    # Reasoning models burn the budget on hidden reasoning and return
-                    # empty content at 200 tokens — which used to parse as "all OK".
-                    "max_tokens": 900,
+                    "max_tokens": CLASSIFY_MAX_TOKENS,
                     "temperature": 0
                 }
             )
             if r.status_code == 200:
                 ans = (r.json()["choices"][0]["message"].get("content") or "").strip()
-                if not ans:
-                    logger.warning(
-                        f"AI batch classify returned empty content (model={CLASSIFY_MODEL}) "
-                        f"→ verdict unavailable")
-                    return ({}, "OK", False)
-                labels, overall = _parse_batch_result(ans, len(messages))
-                return (labels, overall, True)
-            elif r.status_code in (401, 403):
-                logger.error(f"AI batch classify token invalid (HTTP {r.status_code}), disabling AI")
+                if ans:
+                    return ans
+                logger.warning(f"AI classify empty content (model={model}, "
+                               f"max_tokens={CLASSIFY_MAX_TOKENS}) → trying next model")
+                return ""
+            if r.status_code in (401, 403):
+                logger.error(f"AI classify token invalid (HTTP {r.status_code}), disabling AI")
                 await _disable_ai_due_to_auth()
-            else:
-                body = ""
-                try:
-                    body = (r.json().get("error") or {}).get("message", "")
-                except Exception:
-                    body = r.text[:200]
-                logger.error(f"AI batch classify HTTP {r.status_code}: {body}")
+                return ""
+            body = ""
+            try:
+                body = (r.json().get("error") or {}).get("message", "")
+            except Exception:
+                body = r.text[:200]
+            logger.error(f"AI classify HTTP {r.status_code} (model={model}): {body}")
     except Exception as e:
-        logger.error(f"AI batch classify error: {type(e).__name__}: {e}")
-    return ({}, "OK", False)
+        logger.error(f"AI classify error (model={model}): {type(e).__name__}: {e}")
+    return ""
 
 
 def _parse_batch_result(answer: str, count: int) -> tuple[dict[int, str], str]:
@@ -1079,9 +1178,10 @@ async def _flush_pending_queue(uid: int):
     notes: list[str] = []
     if AI_ENABLED and to_classify:
         if not ai_ok:
-            logger.warning(f"Batch for user {uid}: AI verdict unavailable → 未AI审查 tag")
-            if AI_FAIL_TAG_ENABLED:
-                notes.append("⚠️未AI审查")
+            # 不猜：AI 挂了就把这批消息暂扣，等主人点放行/丢弃。
+            await hold_for_owner_review(uid, first.get("full_name", ""),
+                                        first.get("username", ""), msgs)
+            return
         elif ai_labels or overall == "SPAM":
             detail = "/".join(sorted({v for v in ai_labels.values()})) or "OVERALL"
             for oi, label in ai_labels.items():
@@ -2313,6 +2413,8 @@ def build_abuse_history(uid: int):
                 icon, label_text = "🏷", "昵称广告"
             elif kind == "abuse":
                 icon, label_text = "🚫", "脏话"
+            elif kind == "held":
+                icon, label_text = "⏳", "待审(AI不可用)"
             else:
                 icon, label_text = "🟡", "广告"
             t = to_local_time(entry.get("time", ""), UTC_OFFSET)
@@ -2526,6 +2628,7 @@ async def handle_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_config(cfg)
         if mode == "classify_model":
             CLASSIFY_MODEL = model_name
+            CLASSIFY_MODELS = [model_name]
         elif mode == "insult_model":
             INSULT_MODEL = model_name
         label = "分类" if mode == "classify_model" else "回骂"
@@ -2655,6 +2758,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     chat_id = query.message.chat_id
     msg_id = query.message.message_id
+
+    # --- 暂扣消息放行 / 丢弃（AI 审核不可用时） ---
+    if data.startswith("held_"):
+        action, _, token = data[5:].partition("_")
+        if action == "rel":
+            n = await release_held(token)
+            await query.edit_message_text(
+                "⌛ 这条待审消息已失效（可能已处理过或服务重启过）" if n < 0
+                else f"✅ 已放行并转发 {n} 条")
+        else:
+            ok = await drop_held(token)
+            await query.edit_message_text(
+                "⌛ 这条待审消息已失效（可能已处理过或服务重启过）" if not ok
+                else "🚫 已丢弃，并计入一次广告命中")
+        return
 
     # Helper to edit current message (retries transient failures)
     async def edit(text, markup=None):
@@ -3156,6 +3274,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_config(cfg)
         if mode == "classify_model":
             CLASSIFY_MODEL = model_id
+            CLASSIFY_MODELS = [model_id]
         else:
             INSULT_MODEL = model_id
         AI_BASE_URL = new_base

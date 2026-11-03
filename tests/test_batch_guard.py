@@ -75,7 +75,7 @@ class FakeState:
         return dict(self.users.get(uid, {}))
 
 
-sent, forwarded, purged = [], [], []
+sent, forwarded, purged, owner_buttons = [], [], [], []
 
 
 async def fake_send_msg(chat_id, text, reply_to_message_id=0):
@@ -92,17 +92,25 @@ async def fake_schedule(uid, delay=None):
     return None
 
 
-def install_stubs(ai_result=({}, "OK", False), ai_enabled=True, fail_tag=True, ai_labels=None):
+async def fake_owner_buttons(text, markup):
+    sent.append(text)
+    owner_buttons.append(markup)
+    return 1
+
+
+def install_stubs(ai_result=({}, "OK", True), ai_enabled=True, ai_labels=None):
     fw.state = FakeState()
     fw.send_msg = fake_send_msg
     fw.forward_to_owner = fake_forward_to_owner
     fw._schedule_batch_flush = fake_schedule
+    fw.send_owner_buttons = fake_owner_buttons
     fw.AI_ENABLED = ai_enabled
-    fw.AI_FAIL_TAG_ENABLED = fail_tag
     fw._pending_queues.clear()
+    fw._held_messages.clear()
     sent.clear()
     forwarded.clear()
     purged.clear()
+    owner_buttons.clear()
 
     async def fake_ai(messages, profile=""):
         return ai_result if ai_labels is None else (ai_labels, "OK", True)
@@ -150,23 +158,46 @@ async def run():
     if forwarded:
         fails.append(f"2: batch forwarded during cooldown: {forwarded}")
 
-    # --- 3. AI unavailable → forward, but tagged 未AI审查 ---
+    # --- 3. AI 不可用 → 暂扣，不转发，等主人放行 ---
     install_stubs(ai_result=({}, "OK", False))
     fw._pending_queues[603] = {"messages": [entry("老师好，想学吉他")], "first_ts": time.time(),
                                "timer_task": None}
     await fw._flush_pending_queue(603)
-    if len(forwarded) != 1:
-        fails.append(f"3: expected 1 forward, got {forwarded}")
-    elif "⚠️未AI审查" not in forwarded[0]["notes"]:
-        fails.append(f"3: AI failure was not tagged: {forwarded[0]}")
+    if forwarded:
+        fails.append(f"3: AI-down message was forwarded instead of held: {forwarded}")
+    if len(fw._held_messages) != 1:
+        fails.append(f"3: expected 1 held batch, got {list(fw._held_messages)}")
+    if not any("暂扣" in s for s in sent):
+        fails.append(f"3: owner was not asked to review: {sent}")
+    if not owner_buttons or len(owner_buttons[0].inline_keyboard[0]) != 2:
+        fails.append(f"3: review notice has no 放行/丢弃 buttons: {owner_buttons}")
+    if not any(h.get("type") == "held"
+               for h in fw.state.get(603).get("abuse_history", [])):
+        fails.append(f"3: held content not recorded: {fw.state.get(603).get('abuse_history')}")
 
-    # --- 4. ai_fail_tag=False → forward untagged ---
-    install_stubs(ai_result=({}, "OK", False), fail_tag=False)
+    # --- 3b. 主人点「放行」→ 转发出去，带人工放行标记 ---
+    token = next(iter(fw._held_messages))
+    released = await fw.release_held(token)
+    if released != 1 or len(forwarded) != 1:
+        fails.append(f"3b: release failed (released={released}, fwd={forwarded})")
+    elif "✅人工放行" not in forwarded[0]["notes"]:
+        fails.append(f"3b: released message lost its tag: {forwarded[0]}")
+    if await fw.release_held(token) != -1:
+        fails.append("3b: released token was reusable")
+
+    # --- 4. 主人点「丢弃」→ 不转发，计一次命中 ---
+    install_stubs(ai_result=({}, "OK", False))
     fw._pending_queues[604] = {"messages": [entry("老师好")], "first_ts": time.time(),
                                "timer_task": None}
     await fw._flush_pending_queue(604)
-    if not forwarded or forwarded[0]["notes"]:
-        fails.append(f"4: fail-tag switch ignored: {forwarded}")
+    token4 = next(iter(fw._held_messages))
+    if not await fw.drop_held(token4):
+        fails.append("4: drop_held returned False")
+    us4 = fw.state.get(604)
+    if forwarded:
+        fails.append(f"4: dropped message was forwarded: {forwarded}")
+    if us4.get("spam_count") != 1:
+        fails.append(f"4: drop did not count a hit: {us4.get('spam_count')}")
 
     # --- 5. AI 判 SPAM 而本地 0 命中（外文广告）→ 不转发，计入命中并通知主人 ---
     install_stubs(ai_labels={0: "SPAM"})
