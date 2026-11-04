@@ -14,7 +14,7 @@ Features:
 - Blocked user management, auto-reply, keyword management
 """
 
-__version__ = "1.10.3"
+__version__ = "1.10.4"
 
 import asyncio, json, logging, os, re, signal, sys, time, unicodedata
 import httpx
@@ -807,15 +807,15 @@ async def forward_to_owner(uid: int, name: str, username: str, text: str,
     return 0
 
 
-async def notify_owner_ai_block(uid: int, name: str, username: str, detail: str,
-                                count: int, spam_count: int) -> None:
-    """Tell the owner a batch was blocked by the AI classifier (ad text NOT included)."""
-    uname = f" @{username}" if username else ""
-    who = f"{name or '未知用户'}{uname}"
-    nth = "已拉黑" if spam_count >= SPAM_BLOCK_AT else f"第 {spam_count} 次命中"
-    text = (f"🛡️ 已拦截疑似广告（AI 判定：{detail}）\n"
+async def notify_owner_blocked(uid: int, source: str, spam_count: int) -> None:
+    """拉黑时给主人一条提醒（第 1 次命中不打扰）。"""
+    u = state.get(uid) or {}
+    uname = f" @{u.get('username')}" if u.get("username") else ""
+    who = f"{u.get('full_name') or '未知用户'}{uname}"
+    how = "昵称广告" if source == "name" else "消息广告"
+    text = (f"🚫 已自动拉黑\n"
             f"来自 {who}\n"
-            f"ID {uid} · 本批 {count} 条 · {nth}\n"
+            f"ID {uid} · 第 {spam_count} 次命中（{how}）\n"
             f"原文可在此用户的「📝 屏蔽记录」里查看")
     await send_msg(OWNER_ID, text)
 
@@ -1190,8 +1190,6 @@ async def _flush_pending_queue(uid: int):
                 await record_blocked_content(uid, f"[昵称] {profile}", "nickname", ["AI:OVERALL"])
             spam_c = await apply_spam_hit(uid, spam_c, now, msgs[0].get("msg_id", 0),
                                           source="text", notify=False)
-            await notify_owner_ai_block(uid, first.get("full_name", ""),
-                                        first.get("username", ""), detail, len(msgs), spam_c)
             logger.info(f"Batch for user {uid}: AI={detail} (local 0 hits) → blocked, "
                         f"not forwarded, spam_count={spam_c}")
             return
@@ -1297,6 +1295,7 @@ async def apply_spam_hit(uid: int, spam_c: int, now: str, reply_to_msg_id: int =
         update_kw["blocked"] = True
         if notify:
             await send_msg(uid, texts[-1], reply_to_message_id=reply_to_msg_id)
+        await notify_owner_blocked(uid, source, spam_c)
     elif notify:
         await send_msg(uid, texts[0], reply_to_message_id=reply_to_msg_id)
     await state.update(uid, **update_kw)

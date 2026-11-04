@@ -75,11 +75,12 @@ class FakeState:
         return dict(self.users.get(uid, {}))
 
 
-sent, forwarded, purged, owner_buttons = [], [], [], []
+sent, forwarded, purged = [], [], []
+owner_msgs, owner_buttons = [], []
 
 
 async def fake_send_msg(chat_id, text, reply_to_message_id=0):
-    sent.append(text)
+    (owner_msgs if chat_id == 1 else sent).append(text)
     return True
 
 
@@ -93,7 +94,7 @@ async def fake_schedule(uid, delay=None):
 
 
 async def fake_owner_buttons(text, markup):
-    sent.append(text)
+    owner_msgs.append(text)
     owner_buttons.append(markup)
     return 1
 
@@ -110,6 +111,7 @@ def install_stubs(ai_result=({}, "OK", True), ai_enabled=True, ai_labels=None):
     sent.clear()
     forwarded.clear()
     purged.clear()
+    owner_msgs.clear()
     owner_buttons.clear()
 
     async def fake_ai(messages, profile=""):
@@ -167,7 +169,7 @@ async def run():
         fails.append(f"3: AI-down message was forwarded instead of held: {forwarded}")
     if len(fw._held_messages) != 1:
         fails.append(f"3: expected 1 held batch, got {list(fw._held_messages)}")
-    if not any("暂扣" in s for s in sent):
+    if not any("暂扣" in s for s in owner_msgs):
         fails.append(f"3: owner was not asked to review: {sent}")
     if not owner_buttons or len(owner_buttons[0].inline_keyboard[0]) != 2:
         fails.append(f"3: review notice has no 放行/丢弃 buttons: {owner_buttons}")
@@ -211,8 +213,22 @@ async def run():
         fails.append(f"5: AI hit not counted, spam_count={us.get('spam_count')}")
     if us.get("approved"):
         fails.append("5: AI-flagged user must not count toward approval")
-    if not any("已拦截疑似广告" in s for s in sent):
-        fails.append(f"5: owner was not notified about the AI block: {sent}")
+    # 第 1 次命中静默：拦截生效但不推送提醒（只进屏蔽记录 + 统计）
+    if owner_msgs:
+        fails.append(f"5: first hit must stay silent, got {owner_msgs}")
+    if not any(h.get("matched") == ["AI:SPAM"]
+               for h in fw.state.get(605).get("abuse_history", [])):
+        fails.append(f"5: blocked ad not recorded: {fw.state.get(605).get('abuse_history')}")
+
+    # --- 5a. 第 1 次命中不提醒（本地词库路径也一样） ---
+    install_stubs(ai_enabled=False)
+    fw._pending_queues[611] = {"messages": [entry("点位对接加微 abc", local="SPAM", msg_id=1)],
+                               "first_ts": time.time(), "timer_task": None}
+    await fw._flush_pending_queue(611)
+    if forwarded:
+        fails.append(f"5a: local ad forwarded: {forwarded}")
+    if owner_msgs:
+        fails.append(f"5a: first local hit must stay silent: {owner_msgs}")
 
     # --- 5b. AI 判定 + 第二次命中 → 直接拉黑 ---
     install_stubs(ai_labels={0: "SPAM"})
@@ -225,6 +241,10 @@ async def run():
         fails.append(f"5b: second AI hit was forwarded: {forwarded}")
     if not fw.state.get(610).get("blocked"):
         fails.append(f"5b: second AI hit must block, state={fw.state.get(610)}")
+    if not any("已自动拉黑" in s for s in owner_msgs):
+        fails.append(f"5b: block must notify the owner once: {owner_msgs}")
+    if len([s for s in owner_msgs if "已自动拉黑" in s]) != 1:
+        fails.append(f"5b: expected exactly one block notice: {owner_msgs}")
 
     # --- 6. One local hit in a batch → whole batch dropped, warning sent ---
     install_stubs(ai_enabled=False)
