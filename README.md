@@ -222,7 +222,7 @@ docker compose up -d --build
 | 键 | 说明 |
 |---|---|
 | `platform` | `openrouter` 或 `siliconflow`，决定默认 `base_url` |
-| `api_key` | 留空 = 完全不启用 AI，只用本地词库。**`enabled` 字段无效**，是按 `api_key` 是否为空判断的 |
+| `api_key` | 留空 = 完全不启用 AI，只用本地词库。没有独立的启用开关，就按这个字段判断（旧配置里的 `ai.enabled` 已废弃、会被忽略） |
 | `base_url` | 兼容 OpenAI 的接口地址，自定义网关也可用 |
 | `classify_model` | 分类模型；面板里改成别的模型会自动覆盖 `classify_models` |
 | `classify_models` | 模型链，按顺序尝试，全失败才算 AI 不可用 |
@@ -305,8 +305,8 @@ docker compose up -d --build
 **AI 会不会误伤真实客户？**
 会，所以 AI 判 SPAM 时不给对方发任何警告，只静默计数并留档；你翻「屏蔽记录」就能恢复。真想让它完全不参与，把 `ai.api_key` 留空即可。
 
-**把 AI 关了为什么还在调用？**
-`ai.enabled` 是历史遗留字段，代码只看 `api_key` 是否为空。清空 `api_key`（或置 `abuse_manual_off: true` 只关回怼）。
+**怎么彻底关掉 AI？**
+没有独立开关：清空 `ai.api_key` 就完全停用（不再请求任何外部接口）；只想关掉自动回怼，置 `ai.abuse_manual_off: true`。旧版本配置里可能残留 `ai.enabled`，它不参与任何判断，可以直接删掉。
 
 **免费模型时好时坏？**
 免费模型有并发和额度限制，`content` 空正文也常见。所以分类走模型链（`classify_models`，主 + 备），全失败才判定不可用并暂扣消息。可以把面板里「测试 AI 连接」当健康检查。
