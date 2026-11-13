@@ -227,7 +227,6 @@ cfg['owner_id'] = int('$OWNER_ID')
 # AI settings
 if '$AI_ENABLED' == 'true':
     cfg.setdefault('ai', {})
-    cfg['ai']['enabled'] = True
     if '$AI_KEY':
         cfg['ai']['api_key'] = '$AI_KEY'
     if '$AI_BASE':
@@ -467,13 +466,12 @@ print(f'  API密钥: {\"已设置\" if ai.get(\"api_key\") else \"未设置（�
 print(f'  Base URL: {ai.get(\"base_url\", \"未设置\")}')
 print(f'  分类模型: {ai.get(\"classify_model\", \"未设置\")}')
 print(f'  回骂模型: {ai.get(\"insult_model\", \"未设置\")}')
-print(f'  AI开关: {\"开启\" if ai.get(\"enabled\") else \"关闭\"}')
+print(f'  AI自动分类: {\"开启\" if ai.get(\"api_key\") else \"关闭（未配置 API 密钥）\"}')
 "
 
         echo ""
         echo "  要修改什么？"
         echo "    1) 更换 AI 平台/API密钥/模型"
-        echo "    2) 开关 AI 功能"
         echo "    0) 返回"
         echo -n "  请选择: "
         read -r SUB
@@ -489,7 +487,6 @@ with open('$CONF') as f:
     cfg = json.load(f)
 cfg.setdefault('ai', {})
 if '$AI_ENABLED' == 'true':
-    cfg['ai']['enabled'] = True
     if '$AI_KEY':
         cfg['ai']['api_key'] = '$AI_KEY'
     if '$AI_BASE':
@@ -500,8 +497,6 @@ if '$AI_ENABLED' == 'true':
         cfg['ai']['classify_model'] = '$CLASSIFY_MODEL'
     if '$INSULT_MODEL':
         cfg['ai']['insult_model'] = '$INSULT_MODEL'
-else:
-    cfg['ai']['enabled'] = False
 with open('$CONF', 'w') as f:
     json.dump(cfg, f, ensure_ascii=False, indent=2)
 print('Saved')
@@ -517,129 +512,10 @@ print('Saved')
             else
                 echo -e "${YELLOW}  配置未保存${NC}"
             fi
-        elif [ "$SUB" = "2" ]; then
-            # Toggle AI on/off
-            python3 -c "
-import json
-with open('$CONF') as f:
-    cfg = json.load(f)
-ai = cfg.setdefault('ai', {})
-current = ai.get('enabled', False)
-ai['enabled'] = not current
-with open('$CONF', 'w') as f:
-    json.dump(cfg, f, ensure_ascii=False, indent=2)
-print('ON' if ai['enabled'] else 'OFF')
-" > /tmp/ai_toggle_result
-            local TOGGLE=$(cat /tmp/ai_toggle_result 2>/dev/null)
-            local TAG=$(python3 -c "import hashlib, os; print(hashlib.md5(os.path.abspath('$CONF').encode()).hexdigest()[:8])")
-            local SVC="tg-forwarder@${TAG}"
-            if systemctl --user is-active "$SVC" &>/dev/null 2>&1; then
-                systemctl --user restart "$SVC"
-            elif systemctl is-active "$SVC" &>/dev/null 2>&1; then
-                systemctl restart "$SVC"
-            fi
-            if [ "$TOGGLE" = "ON" ]; then
-                echo -e "${GREEN}✅ AI 功能已开启并重启${NC}"
-            else
-                echo -e "${GREEN}✅ AI 功能已关闭并重启${NC}"
-            fi
-            rm -f /tmp/ai_toggle_result
         fi
     fi
 }
 
-# ============================================================
-toggle_features() {
-    echo ""
-    echo -e "${BLUE}=== 开关功能 ===${NC}"
-    echo "  选择要操作机器人："
-    echo "  0) 返回"
-    local BOTS=()
-    local i=1
-    if [ -d "$INSTALL_DIR/instances" ]; then
-        for d in "$INSTALL_DIR/instances"/bot_*; do
-            if [ -f "$d/config.json" ]; then
-                local OID=$(python3 -c "import json; print(json.load(open('$d/config.json')).get('owner_id','?'))" 2>/dev/null)
-                echo "  $i) bot_${OID}"
-                BOTS+=("$d/config.json")
-                ((i++))
-            fi
-        done
-    fi
-    if [ ${#BOTS[@]} -eq 0 ]; then
-        echo "  没有已配置的机器人"
-        return
-    fi
-    echo -n "  请选择: "
-    read -r CHOICE
-    if [ "$CHOICE" = "0" ] || [ -z "$CHOICE" ]; then
-        return
-    fi
-    local IDX=$((CHOICE - 1))
-    if [ "$IDX" -lt 0 ] || [ "$IDX" -ge ${#BOTS[@]} ]; then
-        return
-    fi
-    local CONF="${BOTS[$IDX]}"
-
-    echo ""
-    echo "  功能开关："
-    echo "    1) AI 智能识别    (开关)"
-    echo "    2) 关键词屏蔽     (开关)"
-    echo "    3) 脏话回骂       (开关)"
-    echo "    4) 广告警告       (开关)"
-    echo "    0) 返回"
-    echo -n "  请选择: "
-    read -r SUB
-
-    local KEY=""
-    local LABEL=""
-    case "$SUB" in
-        1) KEY="ai.enabled"; LABEL="AI 智能识别" ;;
-        2) KEY="keyword_enabled"; LABEL="关键词屏蔽" ;;
-        3) KEY="insult_enabled"; LABEL="脏话回骂" ;;
-        4) KEY="ad_warning_enabled"; LABEL="广告警告" ;;
-        0) return ;;
-        *) return ;;
-    esac
-
-    # Toggle
-    local TAG=$(python3 -c "import hashlib, os; print(hashlib.md5(os.path.abspath('$CONF').encode()).hexdigest()[:8])")
-    local SVC="tg-forwarder@${TAG}"
-    local MAIN_KEY=$(echo "$KEY" | cut -d. -f1)
-    local SUB_KEY=$(echo "$KEY" | cut -d. -f2)
-
-    python3 -c "
-import json
-with open('$CONF') as f:
-    cfg = json.load(f)
-section = cfg.setdefault('$MAIN_KEY', {})
-if isinstance(section, dict):
-    current = section.get('$SUB_KEY', True)
-    section['$SUB_KEY'] = not current
-    new_state = not current
-else:
-    new_state = not section
-    cfg['$MAIN_KEY'] = new_state
-with open('$CONF', 'w') as f:
-    json.dump(cfg, f, ensure_ascii=False, indent=2)
-print('ON' if new_state else 'OFF')
-" > /tmp/feature_toggle_result
-    local STATE=$(cat /tmp/feature_toggle_result 2>/dev/null)
-    rm -f /tmp/feature_toggle_result
-
-    # Restart
-    if systemctl --user is-active "$SVC" &>/dev/null 2>&1; then
-        systemctl --user restart "$SVC"
-    elif systemctl is-active "$SVC" &>/dev/null 2>&1; then
-        systemctl restart "$SVC"
-    fi
-
-    if [ "$STATE" = "ON" ]; then
-        echo -e "${GREEN}✅ ${LABEL} 已开启并重启${NC}"
-    else
-        echo -e "${GREEN}✅ ${LABEL} 已关闭并重启${NC}"
-    fi
-}
 
 # ============================================================
 detect_install_method() {
@@ -680,11 +556,10 @@ main_menu() {
         echo "  3) 删除机器人"
         echo "  4) 重启所有机器人"
         echo "  5) 修改 AI 配置"
-        echo "  6) 开关功能"
-        echo "  7) 更新程序 (git pull)"
+        echo "  6) 更新程序 (git pull)"
         echo "  0) 退出"
         echo ""
-        echo -n "  请选择 [0-7]: "
+        echo -n "  请选择 [0-6]: "
         read -r CHOICE
 
         case "$CHOICE" in
@@ -722,9 +597,6 @@ main_menu() {
                 edit_ai
                 ;;
             6)
-                toggle_features
-                ;;
-            7)
                 echo -e "${BLUE}[*] 更新代码...${NC}"
                 cd "$INSTALL_DIR"
                 git pull --ff-only origin main 2>/dev/null && echo -e "${GREEN}✅ 更新完成${NC}" || echo -e "${YELLOW}⚠️  更新失败${NC}"
@@ -821,7 +693,6 @@ import json
 with open('data/config.json') as f:
     cfg = json.load(f)
 cfg.setdefault('ai', {})
-cfg['ai']['enabled'] = True
 if '$AI_KEY': cfg['ai']['api_key'] = '$AI_KEY'
 if '$AI_BASE': cfg['ai']['base_url'] = '$AI_BASE'
 if '$AI_PLATFORM': cfg['ai']['platform'] = '$AI_PLATFORM'
