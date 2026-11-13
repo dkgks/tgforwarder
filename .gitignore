@@ -31,6 +31,9 @@ backup/
 *.backup
 *.gitbak
 forwarder.py.bak-*
+# 配置备份里可能含 bot token，禁止入库（config.json / instances/ 已被忽略，但带时间戳的备份不匹配）
+*.json.bak-*
+*.json.backup
 _apply_patches.py
 forwarder_patched.py
 # 运行时产物
